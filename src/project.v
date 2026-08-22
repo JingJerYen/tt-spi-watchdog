@@ -30,118 +30,56 @@ module tt_um_spi_watchdog (
   wire kick_pin = ui_in[4];
 
   // ------------------------------------------------------------------
-  // Input synchronisers
+  // SPI register interface
   //
-  // SCLK and CS_N cross from the SPI master's clock domain, KICK is a
-  // free-running asynchronous pin. All three get two flops; SCLK gets a
-  // third so both edges can be recovered by comparing stages 1 and 2.
+  // Frame layout and the exact-length rule live in spi_regs; this module
+  // only sees committed register writes and a combinational read port.
   // ------------------------------------------------------------------
-  reg sclk_sync_0, sclk_sync_1, sclk_sync_2;
-  reg cs_n_sync_0, cs_n_sync_1, cs_n_sync_2;
-  reg kick_sync_0, kick_sync_1, kick_sync_2;
+  wire       wr_en;
+  wire [1:0] wr_addr;
+  wire [6:0] wr_data;
+  wire [1:0] rd_addr;
+  reg  [6:0] rd_data;
+  wire       miso;
 
+  spi_regs #(
+      .AW(2),
+      .DW(7)
+  ) u_spi (
+      .clk    (clk),
+      .rst_n  (rst_n),
+      .sclk   (sclk),
+      .mosi   (mosi),
+      .cs_n   (cs_n),
+      .miso   (miso),
+      .wr_en  (wr_en),
+      .wr_addr(wr_addr),
+      .wr_data(wr_data),
+      .rd_addr(rd_addr),
+      .rd_data(rd_data)
+  );
+
+  // KICK is a free-running asynchronous pin, so it needs its own
+  // synchroniser and edge detector.
+  reg kick_s0, kick_s1, kick_s2;
   always @(posedge clk) begin
     if (!rst_n) begin
-      sclk_sync_0 <= 1'b0;
-      sclk_sync_1 <= 1'b0;
-      sclk_sync_2 <= 1'b0;
-      cs_n_sync_0 <= 1'b1;
-      cs_n_sync_1 <= 1'b1;
-      cs_n_sync_2 <= 1'b1;
-      kick_sync_0 <= 1'b0;
-      kick_sync_1 <= 1'b0;
-      kick_sync_2 <= 1'b0;
+      kick_s0 <= 1'b0;
+      kick_s1 <= 1'b0;
+      kick_s2 <= 1'b0;
     end else begin
-      sclk_sync_0 <= sclk;
-      sclk_sync_1 <= sclk_sync_0;
-      sclk_sync_2 <= sclk_sync_1;
-      cs_n_sync_0 <= cs_n;
-      cs_n_sync_1 <= cs_n_sync_0;
-      cs_n_sync_2 <= cs_n_sync_1;
-      kick_sync_0 <= kick_pin;
-      kick_sync_1 <= kick_sync_0;
-      kick_sync_2 <= kick_sync_1;
+      kick_s0 <= kick_pin;
+      kick_s1 <= kick_s0;
+      kick_s2 <= kick_s1;
     end
   end
-
-  wire cs_n_sync   = cs_n_sync_1;
-  wire sclk_rise   = sclk_sync_1 & ~sclk_sync_2;
-  wire sclk_fall   = ~sclk_sync_1 & sclk_sync_2;
-  wire cs_n_rise   = cs_n_sync_1 & ~cs_n_sync_2;  // end of frame
-
-  wire spi_sample  = sclk_rise & ~cs_n_sync;      // mode 0: latch MOSI here
-  wire spi_shift_o = sclk_fall & ~cs_n_sync;      // mode 0: MISO changes here
-
-  wire kick_pin_evt = kick_sync_1 & ~kick_sync_2; // rising edge on KICK pin
-
-  // ------------------------------------------------------------------
-  // SPI shift register
-  //
-  // 10-bit frame, MSB first. The bit counter saturates at 11 so that an
-  // over-long frame is distinguishable from an exact one; the frame is
-  // only acted on if exactly 10 bits arrived before CS_N went high.
-  // ------------------------------------------------------------------
-  localparam SPI_BITS = 10;
-
-  reg [SPI_BITS-1:0] spi_rx;
-  reg [3:0]          spi_cnt;
-  reg [6:0]          spi_tx;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      spi_rx  <= {SPI_BITS{1'b0}};
-      spi_cnt <= 4'd0;
-    end else if (cs_n_rise) begin
-      spi_cnt <= 4'd0;                            // frame consumed, re-arm
-    end else if (spi_sample) begin
-      spi_rx <= {spi_rx[SPI_BITS-2:0], mosi};
-      if (spi_cnt != 4'd11) spi_cnt <= spi_cnt + 4'd1;  // saturate
-    end
-  end
-
-  // A frame commits on the CS_N rising edge, and only at exactly 10 bits.
-  wire frame_ok = cs_n_rise & (spi_cnt == SPI_BITS);
-
-  // These slices are only meaningful once the whole frame has arrived and
-  // every field has shifted into its final position. That is exactly when
-  // writes commit (on frame_ok), so the write path can use them directly.
-  wire       f_write = ~spi_rx[9];
-  wire [1:0] f_addr  =  spi_rx[8:7];
-  wire [6:0] f_data  =  spi_rx[6:0];
-
-  // Reads cannot use them. SPI is full duplex, so the master is clocking
-  // MISO in while it is still clocking ADDR out: the register value has to
-  // be loaded by spi_cnt 3, seven bits before the frame ends. At that point
-  // spi_rx[8:7] still holds whatever happens to be passing through, not the
-  // address -- it only lands there once the last bit is in.
-  //
-  // So the read path captures each field off mosi the cycle it arrives,
-  // before shifting can carry it away:
-  //
-  //   spi_cnt 0 -> R/W
-  //   spi_cnt 1 -> ADDR[1]
-  //   spi_cnt 2 -> ADDR[0]
-  reg        rd_req;
-  reg  [1:0] rd_addr;
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      rd_req  <= 1'b0;
-      rd_addr <= 2'd0;
-    end else if (spi_sample) begin
-      case (spi_cnt)
-        4'd0: rd_req  <= mosi;
-        4'd1: rd_addr[1] <= mosi;
-        4'd2: rd_addr[0] <= mosi;
-        default: ;
-      endcase
-    end
-  end
+  wire kick_pin_evt = kick_s1 & ~kick_s2;
 
   localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2;
 
-  wire wr_ctrl   = frame_ok & f_write & (f_addr == ADDR_CTRL);
-  wire wr_kick   = frame_ok & f_write & (f_addr == ADDR_KICK);
-  wire wr_status = frame_ok & f_write & (f_addr == ADDR_STATUS);
+  wire wr_ctrl   = wr_en & (wr_addr == ADDR_CTRL);
+  wire wr_kick   = wr_en & (wr_addr == ADDR_KICK);
+  wire wr_status = wr_en & (wr_addr == ADDR_STATUS);
 
   // ------------------------------------------------------------------
   // Registers
@@ -154,17 +92,16 @@ module tt_um_spi_watchdog (
   wire [6:0] ctrl_rd   = {3'b000, timeout_sel, irq_en, en};
   wire [6:0] status_rd = {5'b0, armed, irq_flag};
 
-  reg [6:0] reg_rd;
   always @(*) begin
     case (rd_addr)
-      ADDR_CTRL:   reg_rd = ctrl_rd;
-      ADDR_STATUS: reg_rd = status_rd;
-      default:     reg_rd = 7'd0;               // KICK and addr 3 read as 0
+      ADDR_CTRL:   rd_data = ctrl_rd;
+      ADDR_STATUS: rd_data = status_rd;
+      default:     rd_data = 7'd0;              // KICK and addr 3 read as 0
     endcase
   end
 
   // KICK: a rising edge on the pin, or an SPI write of 0x5A to addr 1.
-  wire kick_evt = kick_pin_evt | (wr_kick & (f_data == 7'h5A));
+  wire kick_evt = kick_pin_evt | (wr_kick & (wr_data == 7'h5A));
 
   // ------------------------------------------------------------------
   // Watchdog counter
@@ -197,7 +134,7 @@ module tt_um_spi_watchdog (
 
   // A CTRL write clearing EN must disarm in the same cycle it lands,
   // otherwise ARMED reads back stale for one clock.
-  wire clr_en     = wr_ctrl & ~f_data[0];
+  wire clr_en     = wr_ctrl & ~wr_data[0];
   wire en_now     = en & ~clr_en;
 
   // KICK wins over the timeout, matching the PAUSE priority rule.
@@ -231,40 +168,21 @@ module tt_um_spi_watchdog (
     end else begin
       // CTRL is only fully writable in IDLE; while counting, EN alone lands.
       if (wr_ctrl) begin
-        en <= f_data[0];
+        en <= wr_data[0];
         if (!armed) begin
-          irq_en      <= f_data[1];
-          timeout_sel <= f_data[3:2];
+          irq_en      <= wr_data[1];
+          timeout_sel <= wr_data[3:2];
         end
       end
 
       // Sticky flag: set by the timeout, cleared only by W1C or rst_n.
       if (do_timeout)
         irq_flag <= 1'b1;
-      else if (wr_status && f_data[0])
+      else if (wr_status && wr_data[0])
         irq_flag <= 1'b0;
     end
   end
 
-  // ------------------------------------------------------------------
-  // MISO: shifted out MSB first on the SCLK falling edge. The register
-  // value is loaded once the address bits have arrived, so it lines up
-  // with the 7 data bit positions; MISO reads 0 before that.
-  // ------------------------------------------------------------------
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      spi_tx <= 7'd0;
-    end else if (cs_n_sync) begin
-      spi_tx <= 7'd0;
-    end else if (spi_shift_o) begin
-      if (spi_cnt == 4'd3)
-        spi_tx <= rd_req ? reg_rd : 7'd0;       // R/W + ADDR are in, load
-      else
-        spi_tx <= {spi_tx[5:0], 1'b0};
-    end
-  end
-
-  wire miso = spi_tx[6];
   wire irq  = irq_flag & irq_en;
 
   assign uo_out = {6'b0, irq, miso};

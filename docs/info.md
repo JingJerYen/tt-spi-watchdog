@@ -49,6 +49,13 @@ SPI mode 0 (CPOL=0, CPHA=0). MOSI is sampled on the rising edge of `SCLK`, MISO 
        [R/W][ ADDR ][       DATA       ]
 ```
 
+`SCLK` is not used as a clock. It is sampled by the system clock and its
+edges recovered, so `SCLK` must stay well below `clk`: each level has to be
+held for at least two `clk` periods to be seen. That puts the ceiling near
+`clk / 4`, so at 50 MHz keep `SCLK` at or below about 12 MHz, and prefer
+5-10 MHz for margin. `CS_N` must likewise be stable for a few `clk` periods
+before the first `SCLK` edge and after the last.
+
 - `R/W` - 1 = read, 0 = write
 - `ADDR` - 2 bits register address
 - `DATA` - 7 bits. On a write, the value to store. On a read, MOSI is ignored and the register value comes back on MISO in these 7 bit positions; MISO is 0 during the `R/W` and `ADDR` bits.
