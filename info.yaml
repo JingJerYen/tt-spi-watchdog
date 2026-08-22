@@ -35,7 +35,7 @@ pinout:
   # Outputs
   uo[0]: "MISO" # SPI data out (this chip -> master)
   uo[1]: "IRQ" # Watchdog timeout interrupt
-  uo[2]: "RST_N" # watchdog reset output (active low)
+  uo[2]: ""
   uo[3]: ""
   uo[4]: ""
   uo[5]: ""

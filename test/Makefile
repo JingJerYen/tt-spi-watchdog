@@ -8,10 +8,18 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = project.v
 
+# Shrink the watchdog timeouts so they are simulatable. The design uses 23
+# in silicon (168 ms .. 10.7 s at 50 MHz); 8 keeps the same structure with
+# windows of a few hundred cycles. Gate level sim uses the real netlist, so
+# this only applies to RTL.
+WD_BASE_EXP ?= 8
+
 ifneq ($(GATES),yes)
 
 # RTL simulation:
 SIM_BUILD				= sim_build/rtl
+COMPILE_ARGS    += -DWD_BASE_EXP=$(WD_BASE_EXP)
+export WD_BASE_EXP
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
 
 else
