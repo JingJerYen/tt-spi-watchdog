@@ -102,22 +102,38 @@ module tt_um_spi_watchdog (
   // A frame commits on the CS_N rising edge, and only at exactly 10 bits.
   wire frame_ok = cs_n_rise & (spi_cnt == SPI_BITS);
 
-  // At the end of the frame spi_rx holds the whole word, so the write path
-  // can slice it directly. The read path needs the address earlier, while
-  // bits are still shifting, so it gets its own latched copy.
+  // These slices are only meaningful once the whole frame has arrived and
+  // every field has shifted into its final position. That is exactly when
+  // writes commit (on frame_ok), so the write path can use them directly.
   wire       f_write = ~spi_rx[9];
   wire [1:0] f_addr  =  spi_rx[8:7];
   wire [6:0] f_data  =  spi_rx[6:0];
 
+  // Reads cannot use them. SPI is full duplex, so the master is clocking
+  // MISO in while it is still clocking ADDR out: the register value has to
+  // be loaded by spi_cnt 3, seven bits before the frame ends. At that point
+  // spi_rx[8:7] still holds whatever happens to be passing through, not the
+  // address -- it only lands there once the last bit is in.
+  //
+  // So the read path captures each field off mosi the cycle it arrives,
+  // before shifting can carry it away:
+  //
+  //   spi_cnt 0 -> R/W
+  //   spi_cnt 1 -> ADDR[1]
+  //   spi_cnt 2 -> ADDR[0]
   reg        rd_req;
   reg  [1:0] rd_addr;
   always @(posedge clk) begin
     if (!rst_n) begin
       rd_req  <= 1'b0;
       rd_addr <= 2'd0;
-    end else if (spi_sample && spi_cnt == 4'd2) begin
-      rd_req  <= spi_rx[1];          // R/W bit, now two places down
-      rd_addr <= {spi_rx[0], mosi};  // ADDR completes with this bit
+    end else if (spi_sample) begin
+      case (spi_cnt)
+        4'd0: rd_req  <= mosi;
+        4'd1: rd_addr[1] <= mosi;
+        4'd2: rd_addr[0] <= mosi;
+        default: ;
+      endcase
     end
   end
 
