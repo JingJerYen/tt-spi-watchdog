@@ -23,6 +23,18 @@ line/toggle coverage under Verilator while roughly half the rows below are
 unverified — a line executing once says nothing about whether the scenarios
 that matter were reached. Functional coverage is what this document measures.
 
+## Two levels
+
+[test.py](../test/test.py) drives the whole chip through its package pins, so
+the same tests also run against the gate level netlist. It can only infer a
+register write from its side effects.
+
+[test_spi.py](../test/test_spi.py) instantiates `spi_regs` alone via
+[tb_spi.v](../test/tb_spi.v). That exposes `wr_en` / `wr_addr` / `wr_data`
+directly and lets a test drive `rd_data` with any pattern, which is what makes
+A4, A6 and A9 checkable at all. There is no netlist for a submodule, so it is
+RTL only. Group A lives here; groups B through I need the full chip.
+
 ## Running the suite
 
 ```bash
@@ -37,15 +49,15 @@ make -f Makefile.cov cov-report   # annotate and list uncovered points
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
-| A1 | Mode 0: MOSI is sampled on the rising edge of SCLK | [spi_regs.v:88](../src/spi_regs.v#L88) | implicit in every SPI test | PASS |
-| A2 | Mode 0: MISO updates on the falling edge of SCLK | [spi_regs.v:89](../src/spi_regs.v#L89) | implicit in every read | PASS |
-| A3 | Frame is 10 bits, MSB first, `[R/W][ADDR:2][DATA:7]` | [spi_regs.v:56](../src/spi_regs.v#L56) | implicit | PASS |
+| A1 | Mode 0: MOSI is sampled on the rising edge of SCLK | [spi_regs.v:88](../src/spi_regs.v#L88) | [test_spi.py](../test/test_spi.py) `test_a1_mosi_sampled_on_rising_edge` | PASS |
+| A2 | Mode 0: MISO updates on the falling edge of SCLK | [spi_regs.v:89](../src/spi_regs.v#L89) | [test_spi.py](../test/test_spi.py) `test_a2_miso_updates_on_falling_edge` | PASS |
+| A3 | Frame is 10 bits, MSB first, `[R/W][ADDR:2][DATA:7]` | [spi_regs.v:56](../src/spi_regs.v#L56) | [test_spi.py](../test/test_spi.py) `test_a3_frame_layout_and_direction` | PASS |
 | A4 | A frame commits only at exactly 10 bits | [spi_regs.v:109](../src/spi_regs.v#L109) | [test_spi.py](../test/test_spi.py) `test_a4_frame_length_enforced` | PASS |
 | A5 | The bit counter saturates rather than wrapping | [spi_regs.v:103](../src/spi_regs.v#L103) | folded into A4's length sweep | PASS |
-| A6 | On a read, MISO is 0 during the R/W and ADDR bits | [spi_regs.v:144-150](../src/spi_regs.v#L144-L150) | `read()` masks with `& 0x7F`, discarding those bits | TODO |
-| A7 | SCLK edges while CS_N is high are ignored | [spi_regs.v:86](../src/spi_regs.v#L86) | — | TODO |
-| A8 | SCLK / CS_N are asynchronous and synchronised before use | [spi_regs.v:65-84](../src/spi_regs.v#L65-L84) | driven only at fixed clk-aligned phase | TODO |
-| A9 | R/W selects write (0) or read (1) | [spi_regs.v:111](../src/spi_regs.v#L111) | [test.py:98](../test/test.py#L98), [test.py:101](../test/test.py#L101) | PASS |
+| A6 | On a read, MISO is 0 during the R/W and ADDR bits | [spi_regs.v:144-150](../src/spi_regs.v#L144-L150) | [test_spi.py](../test/test_spi.py) `test_a6_miso_zero_during_rw_and_addr` | PASS |
+| A7 | SCLK edges while CS_N is high are ignored | [spi_regs.v:86](../src/spi_regs.v#L86) | [test_spi.py](../test/test_spi.py) `test_a7_sclk_ignored_while_cs_high` | PASS |
+| A8 | SCLK / CS_N are asynchronous and synchronised before use | [spi_regs.v:65-84](../src/spi_regs.v#L65-L84) | not simulatable — see J1 | WAIVE |
+| A9 | R/W selects write (0) or read (1) | [spi_regs.v:111](../src/spi_regs.v#L111) | folded into A3 | PASS |
 
 ### A4 and A5 — one length sweep
 
@@ -73,12 +85,25 @@ Verified by mutation: removing the saturating guard from
 [spi_regs.v:103](../src/spi_regs.v#L103) makes the 26-bit case commit
 `(0, 85)` and the test fail.
 
+### A3 and A9 — one test
+
+A9's two claims -- a write raises `wr_en`, a read raises none while returning
+`rd_data` -- are exactly what A3's write and read halves already assert, so
+they share a test. One corner was genuinely uncovered and is now checked
+there: a *write* frame must not return data either.
+
 ### A6 — a real protocol claim
 
-The datasheet promises MISO is 0 during the first 3 bit positions. A master
-that reads the full 10-bit return word sees those bits. `read()` throws them
-away, so a design that leaked stale `tx` content there would still pass today.
-Assert on the full `rx`, not the masked value.
+The datasheet promises MISO is 0 during the first `1 + AW` bit positions. A
+master reading the full return word sees them. `read()` in
+[test.py](../test/test.py) masks them off, and the watchdog can never return
+an all-ones value anyway, so a design leaking stale `tx` content there would
+pass at chip level. `read_raw()` at the unit level drives `rd_data` all-ones
+and asserts on the whole word.
+
+Verified by mutation: changing
+[spi_regs.v:148](../src/spi_regs.v#L148) to ignore `rd_req` makes a write
+frame return `0x07f` and the A3/A9 test fail.
 
 ---
 
@@ -87,26 +112,35 @@ Assert on the full `rx`, not the masked value.
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
 | B1 | CTRL (addr 0) reads back `{3'b0, TIMEOUT, IRQ_EN, EN}` | [project.v:92](../src/project.v#L92) | [test.py:155](../test/test.py#L155) | PASS |
-| B2 | CTRL bits 6:4 are unimplemented and read as 0 | [project.v:92](../src/project.v#L92) | never written as 1 | TODO |
+| B2 | CTRL bits 6:4 are unimplemented and read as 0 | [project.v:92](../src/project.v#L92) | constant `3'b000` in the readback | WAIVE |
 | B3 | KICK (addr 1) is write-only and reads as 0 | [project.v:99](../src/project.v#L99) | [test.py:174](../test/test.py#L174) | PASS |
 | B4 | STATUS (addr 2) reads `{5'b0, ARMED, IRQ_FLAG}` | [project.v:93](../src/project.v#L93) | many | PASS |
-| B5 | Address 3 is unallocated: reads 0, writes ignored | [project.v:99](../src/project.v#L99) | [test.py:175](../test/test.py#L175) reads only | PART |
-| B6 | STATUS bit 1 (ARMED) is read-only; writes are ignored | [project.v:181](../src/project.v#L181) | — | TODO |
+| B5 | Address 3 is unallocated: reads 0, writes ignored | [project.v:99](../src/project.v#L99) | read half covered at [test.py:175](../test/test.py#L175); write half undecodable | WAIVE |
+| B6 | STATUS bit 1 (ARMED) is read-only; writes are ignored | [project.v:181](../src/project.v#L181) | [test.py](../test/test.py) `test_status_armed_is_read_only` | PASS |
 
-### B2 — check the reserved bits
+### B2 — waived
 
-Write `0x7F` to CTRL and confirm the readback is `0x0F`. A design that
-widened the register by accident would be caught here and nowhere else.
+`ctrl_rd` is `{3'b000, timeout_sel, irq_en, en}`, a literal constant in the
+top three positions. There is no state behind those bits to get wrong.
 
-### B5 — writes to address 3
+### B5 — waived
 
-A write to address 3 must not disturb any other register. Set up known CTRL
-and STATUS values, write to address 3, confirm both are unchanged.
+The read half is covered at [test.py:175](../test/test.py#L175). The write
+half cannot be observed: `spi_regs` raises `wr_en` for address 3 like any
+other, and "ignored" only means [project.v:80-82](../src/project.v#L80-L82)
+never decodes it. With no register there, a write leaves nothing to read back
+and no side effect to detect. The unit-level tests already confirm the address
+reaches `wr_addr` intact, which is the part that is actually checkable.
 
 ### B6 — ARMED is not writable
 
-Only `wr_data[0]` participates in the W1C path. Writing `0x02` to STATUS
-while armed must leave ARMED set; while idle it must leave ARMED clear.
+Only `wr_data[0]` participates in the W1C path, so writing `0x02` to STATUS
+must leave ARMED alone in both directions: it cannot arm from IDLE, nor
+disarm while counting. `test_status_armed_is_read_only` checks both, plus
+that IRQ_FLAG beside it was not disturbed.
+
+Verified by mutation: adding a `wr_status && wr_data[1]` branch that sets
+`armed` makes the test fail with "writing ARMED armed it".
 
 ---
 
@@ -119,30 +153,40 @@ while armed must leave ARMED set; while idle it must leave ARMED clear.
 | C3 | KICK in COUNTING clears the counter, stays armed | [project.v:151-153](../src/project.v#L151-L153) | [test.py:361](../test/test.py#L361) | PASS |
 | C4 | Timeout returns to IDLE and sets IRQ_FLAG | [project.v:154-157](../src/project.v#L154-L157) | [test.py:287](../test/test.py#L287) | PASS |
 | C5 | Clearing EN returns to IDLE | [project.v:148-150](../src/project.v#L148-L150) | [test.py:264](../test/test.py#L264) | PASS |
-| C6 | `rst_n` returns to IDLE from any state | [project.v:145-147](../src/project.v#L145-L147) | [test.py:145](../test/test.py#L145) checks initial values only | PART |
-| C7 | Counter is held at 0 while EN=0 | [project.v:148-150](../src/project.v#L148-L150) | — | TODO |
-| C8 | Clearing EN disarms in the same cycle, with no stale ARMED readback | [project.v:137-138](../src/project.v#L137-L138) | — | TODO |
+| C6 | `rst_n` returns to IDLE from any state | [project.v:145-147](../src/project.v#L145-L147) | [test.py](../test/test.py) `test_reset_from_any_state` | PASS |
+| C7 | Counter is held at 0 while EN=0 | [project.v:148-150](../src/project.v#L148-L150) | implied by C2 and C5 | WAIVE |
+| C8 | Clearing EN disarms in the same cycle, with no stale ARMED readback | [project.v:137-138](../src/project.v#L137-L138) | not observable over SPI | WAIVE |
 
-### C6 — reset while counting
+### C6 — reset from every state
 
-Reset is only ever applied from the power-up state. Arm the watchdog, let the
-counter run partway, assert `rst_n`, and confirm ARMED, IRQ_FLAG and the
-counter all clear — the last one observed indirectly, by checking that the
-next window after re-arming is full length.
+`test_reset_from_any_state` applies reset from IDLE, from COUNTING, and from
+IDLE with IRQ_FLAG already sticky. The third is the only path that exercises
+reset clearing the flag, since a W1C write is otherwise the only way to clear
+it.
 
-### C7 — no counting while disarmed
+Two things this test has to get right. Reset must be held for more than one
+clk and allowed to settle after release — a single cycle does not propagate.
+And reads must come *after* the release: while `rst_n` is low `spi_regs`
+holds `rx` and `cnt` cleared, so no frame is received and `read()` returns 0
+regardless of what the registers hold, making every assertion vacuously true.
 
-With EN=0, wait well past a full timeout window and confirm IRQ never fires.
-Distinct from C2: that one checks arming, this one checks the counter itself
-is held.
+Verified by mutation: changing
+[project.v:167](../src/project.v#L167) so `irq_flag` survives reset makes the
+third case fail.
 
-### C8 — the same-cycle disarm
+### C7 — waived
 
-`en_now` exists specifically so a CTRL write clearing EN disarms on the cycle
-it lands rather than one cycle later. The comment at
-[project.v:135-136](../src/project.v#L135-L136) records the intent. Hard to
-observe over SPI, since the readback is many cycles later — low priority, and
-a candidate for waiving if no clean observation exists.
+Subsumed by C2 and C5. `armed` gates the counter's increment at
+[project.v:157](../src/project.v#L157), and both those tests confirm `armed`
+is low when EN is clear. A separate long wait would re-test the same gate.
+
+### C8 — waived
+
+`en_now` makes a CTRL write clearing EN disarm on the cycle it lands rather
+than one later. There is no way to see this over SPI: the earliest possible
+readback is a whole frame later, by which point both a same-cycle and a
+next-cycle disarm read identically. Not testable through the pins, and the
+pin-level constraint is deliberate — see [Two levels](#two-levels).
 
 ---
 
@@ -150,56 +194,63 @@ a candidate for waiving if no clean observation exists.
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
-| D1 | TIMEOUT=00 fires on counter bit `WD_BASE_EXP` | [project.v:128](../src/project.v#L128) | [test.py:268](../test/test.py#L268) | PASS |
-| D2 | TIMEOUT=01 fires on counter bit `WD_BASE_EXP + 2` | [project.v:129](../src/project.v#L129) | — | TODO |
-| D3 | TIMEOUT=10 fires on counter bit `WD_BASE_EXP + 4` | [project.v:130](../src/project.v#L130) | — | TODO |
-| D4 | TIMEOUT=11 fires on counter bit `WD_BASE_EXP + 6` | [project.v:131](../src/project.v#L131) | used at [test.py:235](../test/test.py#L235) to hold armed, never allowed to fire | TODO |
+| D1 | TIMEOUT=00 fires on counter bit `WD_BASE_EXP` | [project.v:128](../src/project.v#L128) | [test.py:268](../test/test.py#L268), [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D2 | TIMEOUT=01 fires on counter bit `WD_BASE_EXP + 2` | [project.v:129](../src/project.v#L129) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D3 | TIMEOUT=10 fires on counter bit `WD_BASE_EXP + 4` | [project.v:130](../src/project.v#L130) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D4 | TIMEOUT=11 fires on counter bit `WD_BASE_EXP + 6` | [project.v:131](../src/project.v#L131) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
 
-### D2-D4 — the clearest gap in the suite
+### D1-D4 — every selection, timed
 
-All four TIMEOUT values are *written and read back* by
-`test_ctrl_readback`, and the `case` statement at
-[project.v:127-133](../src/project.v#L127-L133) reaches 100% line coverage
-because `always @(*)` re-evaluates every branch. But only `sel=0` has ever
-been timed. Swapping two branches of that `case` would not fail a single
-existing test.
+All four TIMEOUT values were already *written and read back* by
+`test_ctrl_readback`, and the `case` at
+[project.v:127-133](../src/project.v#L127-L133) reaches full line coverage
+because `always @(*)` re-evaluates every branch. Only `sel=0` had ever been
+timed.
 
-`TIMEOUTS` at [test.py:42](../test/test.py#L42) already carries the expected
-exponent per selection; `wait_for_irq` already takes a `timeout_exp`
-argument. The parts are in place.
+`test_all_timeout_selections` measures each window from the kick to the IRQ
+and asserts it lands within 10% of `2**(WD_BASE_EXP + 2*sel)`. Measured:
+257, 1025, 4097 and 16385 clocks against 256, 1024, 4096 and 16384 — the
+extra cycle is the kick's own latency.
 
-Note the simulation cost: with `WD_BASE_EXP=8` the windows are 2^8, 2^10,
-2^12 and 2^14 clocks. All four are cheap. Do not run these against the gate
-level build, where `WD_BASE_EXP` is 23.
+The half-window check before each measurement is what separates one selection
+from its neighbour; without it a window that fired early would still be inside
+the tolerance of a longer one.
 
----
+Verified by mutation: swapping the `2'd1` and `2'd2` branches fails this test,
+while `test_ctrl_readback` and `test_timeout_fires` both still pass — which is
+exactly the gap this row existed to close.
+
+This is RTL only. Against the gate level build, where `WD_BASE_EXP` is 23,
+TIMEOUT=11 would be 2^29 clocks and never finish.
 
 ## E. KICK sources
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
 | E1 | An SPI write of `0x5A` to addr 1 kicks | [project.v:104](../src/project.v#L104) | [test.py:210](../test/test.py#L210) | PASS |
-| E2 | Any other value written to KICK is ignored | [project.v:104](../src/project.v#L104) | [test.py:207](../test/test.py#L207) tests `0x12` only | PART |
+| E2 | Any other value written to KICK is ignored | [project.v:104](../src/project.v#L104) | [test.py:207](../test/test.py#L207) tests `0x12`; exhaustive sweep not worth it | WAIVE |
 | E3 | A rising edge on the KICK pin kicks | [project.v:76](../src/project.v#L76) | [test.py:197](../test/test.py#L197) | PASS |
-| E4 | KICK is edge triggered, not level triggered | [project.v:76](../src/project.v#L76) | — | TODO |
-| E5 | The KICK pin is asynchronous and synchronised | [project.v:64-75](../src/project.v#L64-L75) | driven only at fixed clk-aligned phase | TODO |
+| E4 | KICK is edge triggered, not level triggered | [project.v:76](../src/project.v#L76) | [test.py](../test/test.py) `test_kick_is_not_level_trigger` | PASS |
+| E5 | The KICK pin is asynchronous and synchronised | [project.v:64-75](../src/project.v#L64-L75) | not simulatable — see J1 | WAIVE |
 | E6 | A KICK after a timeout re-arms without clearing IRQ_FLAG | [project.v:179-182](../src/project.v#L179-L182) | [test.py:304](../test/test.py#L304) | PASS |
 
-### E2 — near-miss values
+### E2 — waived
 
-`0x12` shares no bits with `0x5A`. Values one bit away — `0x5B`, `0x58`,
-`0x1A`, `0x7A` — would catch a comparator built from too few bits.
+`0x12` is the only non-magic value tested. Near-miss values (`0x5B`, `0x58`,
+`0x1A`) would catch a comparator built from too few bits, but
+[project.v:104](../src/project.v#L104) is a full-width `==` against a
+literal — there is no partial-decode structure for a sweep to find.
 
-### E4 — the highest-value missing test
+### E4 — the one that mattered most
 
 If [project.v:76](../src/project.v#L76) were `wire kick_pin_evt = kick_s1;`,
-turning the edge detector into a level detector, **every existing test would
-still pass** — `pin_kick()` at [test.py:103](../test/test.py#L103) always
-returns the pin low. A watchdog that can be silenced by tying one pin high is
-a serious failure for the part's actual purpose.
+turning the edge detector into a level detector, every other test would still
+pass — `pin_kick()` at [test.py:103](../test/test.py#L103) always returns the
+pin low, so level and edge behave identically. A watchdog that can be silenced
+by tying one pin high is a serious failure for the part's purpose.
 
-Hold KICK high for more than two full timeout windows and assert that IRQ
-fires anyway.
+`test_kick_is_not_level_trigger` raises KICK and leaves it there: the first
+edge arms the dog, and the timeout must fire anyway while the pin is held.
 
 ---
 
@@ -221,15 +272,20 @@ fires anyway.
 | G2 | IRQ_FLAG is sticky; a KICK does not clear it | [project.v:179-182](../src/project.v#L179-L182) | [test.py:304](../test/test.py#L304) | PASS |
 | G3 | Writing 1 to STATUS bit 0 clears IRQ_FLAG | [project.v:181-182](../src/project.v#L181-L182) | [test.py:315](../test/test.py#L315) | PASS |
 | G4 | Writing 0 to STATUS does not clear IRQ_FLAG | [project.v:181](../src/project.v#L181) | [test.py:310](../test/test.py#L310) | PASS |
-| G5 | Clearing IRQ_EN releases the IRQ pin, flag retained | [project.v:186](../src/project.v#L186) | only the 0 to 1 direction is tested | TODO |
+| G5 | Clearing IRQ_EN releases the IRQ pin, flag retained | [project.v:186](../src/project.v#L186) | [test.py](../test/test.py) `test_irq_en_release_keeps_flag` | PASS |
 | G6 | `rst_n` clears IRQ | [project.v:167](../src/project.v#L167) | [test.py:149](../test/test.py#L149) | PASS |
 
 ### G5 — the other direction
 
-`test_irq_en_gates_pin` sets IRQ_EN from 0 to 1 and watches IRQ appear. The
-reverse — flag set, IRQ_EN cleared, pin drops but STATUS still reads
-IRQ_FLAG=1 — is not tested. Note the ordering constraint from F2: clearing
-IRQ_EN requires being in IDLE.
+`test_irq_en_gates_pin` only goes from IRQ_EN=0 to 1.
+`test_irq_en_release_keeps_flag` covers the reverse: with the flag set,
+clearing IRQ_EN drops the pin while STATUS still reads IRQ_FLAG=1, and
+re-enabling surfaces the same pending interrupt. Note the ordering constraint
+from F2 — CTRL is locked while counting, so IRQ_EN can only be changed after
+the timeout has returned the machine to IDLE.
+
+Verified by mutation: changing
+[project.v:186](../src/project.v#L186) to `irq = irq_flag` makes it fail.
 
 ---
 
@@ -239,22 +295,31 @@ IRQ_EN requires being in IDLE.
 | --- | --- | --- | --- | --- |
 | H1 | PAUSE freezes the counter while high in COUNTING | [project.v:157](../src/project.v#L157) |  [test.py:351](../test/test.py#L351) | PASS |
 | H2 | PAUSE does not change state or disarm | [project.v:157](../src/project.v#L157) | [test.py:352](../test/test.py#L352) | PASS |
-| H3 | PAUSE has no effect in IDLE | [project.v:157](../src/project.v#L157) | — | TODO |
-| H4 | KICK takes priority over PAUSE | [project.v:151](../src/project.v#L151) | — | TODO |
+| H3 | PAUSE has no effect in IDLE | [project.v:157](../src/project.v#L157) | `armed` already gates the counter | WAIVE |
+| H4 | KICK takes priority over PAUSE | [project.v:151](../src/project.v#L151) | [test.py](../test/test.py) `test_kick_is_prior_to_pause` | PASS |
 | H5 | SPI access is unaffected while PAUSE is high | — | [test.py:352](../test/test.py#L352) reads STATUS under PAUSE | PASS |
 | H6 | PAUSE crosses into the clk domain without a synchroniser | [project.v:29](../src/project.v#L29) | — | see note |
 
-### H3 — testing an absence
+### H3 — waived
 
-"No effect" is testable as "leaves no residue". Hold PAUSE through a full
-window while in IDLE, confirm nothing arms and IRQ stays low, then release
-PAUSE, kick, and confirm the resulting window is full length.
+The counter's increment is gated by `armed && !pause` at
+[project.v:157](../src/project.v#L157). In IDLE `armed` is low, so the branch
+is already dead regardless of PAUSE. Nothing PAUSE does there can leave
+residue, because the only state it could touch is held at 0 by C5.
 
 ### H4 — a stated priority
 
-The datasheet says a kick during PAUSE clears the counter, which then stays
-frozen at 0. Observe by kicking under PAUSE, releasing PAUSE, and timing the
-window from the release — it must be a full window, not a partial one.
+The datasheet gives KICK priority over PAUSE: a kick during PAUSE clears the
+counter, which then stays frozen at 0. `test_kick_is_prior_to_pause` observes
+this through the aftermath — after releasing PAUSE, *half* a window must not
+be enough to fire, because a full one remains.
+
+That negative assertion is the whole test. Both a correct and an inverted
+priority eventually fire; they differ only in when. Asserting "it fires
+eventually" passes either way.
+
+Verified by mutation: gating `do_kick` with `~pause` makes it fail with
+"fired after half a window: the kick did not reset the counter".
 
 ### H6 — an RTL observation, not a test item
 
@@ -282,14 +347,20 @@ uniform.
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
-| I1 | `uo_out[7:2]` are driven low | [project.v:188](../src/project.v#L188) | — | TODO |
+| I1 | `uo_out[7:2]` are driven low | [project.v:188](../src/project.v#L188) | [test.py](../test/test.py) `test_unused_pins` | PASS |
 | I2 | `uio_out` and `uio_oe` are tied to 0 | [project.v:20-21](../src/project.v#L20-L21) | — | WAIVE |
-| I3 | `ui_in[7:5]` are unused and affect nothing | [project.v:24](../src/project.v#L24) | — | TODO |
+| I3 | `ui_in[7:5]` are unused and affect nothing | [project.v:24](../src/project.v#L24) | [test.py](../test/test.py) `test_unused_pins` | PASS |
 
-### I1 — cheap to fold in
+### I1 and I3 — one test
 
-Assert `int(dut.uo_out.value) >> 2 == 0` alongside an existing check rather
-than as a test of its own.
+Neither needs a scenario of its own, only ordinary traffic to observe, so
+`test_unused_pins` drives `ui_in[7:5]` high for the whole of a normal
+arm-and-fire cycle and samples `uo_out[7:2]` at four points along it —
+including while IRQ is asserted, which proves the spare bits are not merely a
+stuck-low bus.
+
+Verified by mutation: widening the output concatenation to duplicate `irq`
+into a spare bit fails I1; repointing `pause` at `ui_in[5]` fails I3.
 
 ### I2 — waived
 
@@ -297,10 +368,6 @@ Guaranteed by a constant `assign`. Testing it tests the simulator, not the
 design. This is also the only gap Verilator's coverage report shows, since
 those signals never toggle — the correct behaviour.
 
-### I3 — drive the unused inputs
-
-Set `ui_in[7:5]` high for the duration of an otherwise normal test and
-confirm the result is unchanged. Guards against a typo in a pin index.
 
 ---
 
@@ -308,57 +375,116 @@ confirm the result is unchanged. Guards against a typo in a pin index.
 
 | ID | Feature | Covers | Status |
 | --- | --- | --- | --- |
-| J1 | The design works with SCLK edges at any phase relative to clk | A8, E5 | TODO |
+| J1 | The design works with SCLK edges at any phase relative to clk | A8, E5 | WAIVE |
 
-Every SPI edge is currently driven by `ClockCycles`, so SCLK and CS_N
-transitions land on exact `clk` boundaries — one single phase relationship
-out of the continuum a real master would produce.
+**Waived: the risk this addresses is not simulatable, and the residue is not
+worth its cost here.**
 
-Two things this hides:
+A phase sweep was written, run and then removed. What follows is why, so the
+idea is not reinvented later.
 
-- **Protocol races.** The extra `_settle()` at
-  [test.py:88](../test/test.py#L88), before CS_N rises, exists to keep
-  `cs_n_rise` from colliding with the final `sample` pulse. That collision is
-  phase-dependent; at a different phase the priority chain at
-  [spi_regs.v:99-104](../src/spi_regs.v#L99-L104) clears `cnt` before it
-  reaches 10 and the frame is silently dropped.
-- **Nothing about metastability.** No simulator models it; a synchroniser and
-  a plain wire are indistinguishable in RTL simulation. Phase sweeping finds
-  protocol races, not marginal setup/hold.
+### What cannot be tested at all
 
-A `Timer` offset added to `_settle()` breaks the clk alignment. An exhaustive
-sweep over `range(0, CLK_NS, 2)` is preferable to a random offset here: the
-phase space is small enough to cover completely, so exhaustive is both
-cheaper and stronger than random.
+Metastability. An RTL flop copies `d` to `q` at the clock edge with no
+setup/hold window, so a three-stage synchroniser and a bare wire simulate
+identically. Gate level does not rescue this either: the TT flow runs without
+SDF, and even with it, a testbench that drives SCLK from `ClockCycles` never
+places an edge inside a timing window. A metastable flop settles to a random
+value after an indeterminate delay; `X` propagation models "unknown", which is
+a different thing.
 
----
+### What could be tested, and why it finds little here
+
+Protocol races — a phase at which `cs_n_rise` collides with the final `sample`
+pulse, so `cnt` is cleared before it reaches `FRAME_BITS` and the frame is
+dropped.
+
+The architecture largely rules this out. SCLK passes through three
+synchronising flops before anything looks at it, so by the time `sclk_s1` and
+`sclk_s2` exist, the edge has been quantised onto a clk boundary. Everything
+downstream — `sample`, `shift_out`, `cs_n_rise`, `cnt` — lives in a single
+clock domain. Changing the input phase only changes *which clk cycle* the
+synchroniser first sees the edge in, which is exactly the variation the design
+is built to absorb.
+
+Designs that do need phase sweeping have several clock domains, handshakes, or
+gray-coded counters crossing between them. This one deliberately has none:
+`sclk` is sampled data, not a clock.
+
+### What the experiment showed
+
+Two mutations were run against a 10-phase sweep over `range(0, CLK_NS, 2)`:
+
+| Mutation | Phase sweep | Fixed phase |
+| --- | --- | --- |
+| Remove the guard `_settle()` before CS_N rises | PASS | PASS |
+| Shorten `_settle()` from 4 clk to 3, then 2 | FAIL at phase 0 | FAIL |
+
+Neither isolated a phase-dependent failure. The first shows that guard is
+margin rather than a necessity at a 4-clk settle. The second fails at phase 0,
+so the fixed-phase tests catch it just as well — and it is out-of-spec anyway,
+since [info.md](info.md) requires each SCLK level to be held for at least two
+clk periods.
+
+These mutations do not prove no phase-dependent bug exists; a fairer test
+would mutate the DUT's own synchroniser depth. But combined with the
+architectural argument above, the expected yield is low.
+
+### Cost
+
+The sweep ran 10 phases over both directions: 211 µs of simulation, about 70%
+of the whole unit suite's runtime, to re-test at 10 phases what the
+synchronisers quantise back to one.
+
+### If this is revisited
+
+Reintroduce the sweep if the synchroniser depth in
+[spi_regs.v:65-84](../src/spi_regs.v#L65-L84) is ever reduced, if a second
+clock domain appears, or if silicon shows frames being dropped. A `phase_ns`
+offset on `SpiMaster._settle()`, swept exhaustively rather than randomly, is
+all it takes — the phase space is one clk period wide.
 
 ## Summary
 
 | Status | Count |
 | --- | --- |
-| PASS | 25 |
-| PART | 4 |
-| TODO | 18 |
-| WAIVE | 1 |
-| **Total** | **48** |
+| PASS | 41 |
+| PART | 0 |
+| TODO | 0 |
+| WAIVE | 10 |
+| **Total** | **51** |
 
-Functional coverage is 25/48, about 52%, against 100% line coverage on
-`spi_regs.v`. The gap between those two numbers is the point of this
-document.
+Every row is now either covered or explicitly waived: 41/51 tested,
+10 waived with a reason recorded above. Nothing is left
+outstanding.
 
-## Suggested order
+The waived rows are the useful part of that number. Each one names why the
+behaviour cannot be observed through the pins, or why the structure behind it
+has nothing to get wrong — B5's undecodable write, C8's same-cycle disarm,
+J1's unsimulatable metastability. A count of tests passed says little on its
+own; a count of claims deliberately not tested, each with its reason, is what
+makes the coverage legible.
 
-Ranked by risk caught per unit of effort.
+Line coverage remains 100% on `spi_regs.v` and told us none of this.
 
-| Rank | ID | Why it goes first |
+## Verification method
+
+Tests asserting that something *does not* happen — no write commits, the pin
+stays low, the flag survives — pass just as readily when the test itself is
+broken. Several rows here were checked by mutation: break the RTL in the
+specific way the row describes, confirm the test fails, restore.
+
+| Row | Mutation | Caught |
 | --- | --- | --- |
-| 1 | E4 | A level-vs-edge bug would defeat the watchdog's purpose and pass every current test |
-| 2 | D2-D4 | Three quarters of the timeout settings have never been timed |
-| 3 | H4 | An explicitly documented priority rule with no test behind it |
-| 4 | A6 | A datasheet promise about MISO that the test helper discards |
-| 5 | C6 | Reset is only ever exercised from the power-up state |
-| 6 | J1 | Finds protocol races that no fixed-phase test can reach |
-| 7 | B2, B5, B6 | Register hygiene; quick to write, low individual risk |
-| 8 | H3, C7, G5 | Absence-of-effect cases, each testable via its aftermath |
-| 9 | I1, I3, E2 | Fold into existing tests rather than adding new ones |
+| A4/A5 | Remove the saturating guard on `cnt` | yes |
+| A6/A9 | `tx <= rd_data`, ignoring `rd_req` | yes |
+| B6 | Let a STATUS write set `armed` | yes |
+| C6 | `irq_flag` survives reset | yes |
+| G5 | `irq = irq_flag`, ignoring `irq_en` | yes |
+| H4 | Gate `do_kick` with `~pause` | yes |
+| I1 | Duplicate `irq` into a spare output bit | yes |
+| I3 | Repoint `pause` at `ui_in[5]` | yes |
+| D2-D4 | Swap two branches of the `timeout_bit` case | yes |
+
+Two mutations that were *not* caught are recorded under J1: neither isolated a
+phase-dependent failure, which is part of why that row is waived.

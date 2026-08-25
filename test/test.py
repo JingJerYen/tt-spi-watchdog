@@ -362,7 +362,7 @@ async def test_kick_restarts_window(dut):
     """A kick during counting should restart the counter from zero."""
     spi = await setup(dut, "Kick restarts the window")
 
-    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=3))
     await spi.kick()
 
     # Feed at half the window, via the pin: a pin kick is ~12 clocks, where an
@@ -372,6 +372,269 @@ async def test_kick_restarts_window(dut):
         assert spi.get_out(IRQ) == 0, "fired despite being fed in time"
         await spi.pin_kick()
 
+    # Same, but kick with register
+    for _ in range(3):
+        await ClockCycles(dut.clk, 2**(WD_BASE_EXP - 1))
+        assert spi.get_out(IRQ) == 0, "fired despite being fed in time"
+        await spi.kick()
+
+    # Now stop feeding and let it expire.
+    await wait_for_irq(spi, WD_BASE_EXP + 6)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
+
+
+@cocotb.test()
+async def test_kick_is_not_level_trigger(dut):
+    """same as kick_restarts_window, but not pull down kick pin, so
+    it should always timeout
+    """
+    spi = await setup(dut, "Kick is not level triggered")
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+
+    # kick pin maintains at high
+    spi.set_pin(KICK, 1)
+    await ClockCycles(spi.dut.clk, 6)
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "the rising edge did not arm"
+
+    # time limit
+    await ClockCycles(dut.clk, 2**(WD_BASE_EXP))
+    assert spi.get_out(IRQ) == 1, "level kick = 1 still feed dog"
+
     # Now stop feeding and let it expire.
     await wait_for_irq(spi)
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
+
+
+@cocotb.test()
+async def test_kick_is_prior_to_pause(dut):
+    """If kick and pause comes at the same cycle, kick wins"""
+    spi = await setup(dut, "Kick is prior to pause")
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    await spi.pin_kick()
+
+    # half time window
+    await ClockCycles(dut.clk, 2**(WD_BASE_EXP-1))
+    # kick and pause at same time, kick wins so counter restart from 0
+    # but since pause is still held, so counter freezes at 0
+    spi.set_pin(KICK, 1)
+    spi.set_pin(PAUSE, 1)
+
+    # half and more time, since it paused, counter stays at 0
+    await ClockCycles(dut.clk, 2**(WD_BASE_EXP))
+    assert spi.get_out(IRQ) == 0, "pause not work"
+
+    # cancel pause
+    spi.set_pin(PAUSE, 0)
+
+    # now total is half+slack < timeout, so no irq
+    await ClockCycles(dut.clk, 2**(WD_BASE_EXP-1)+10)
+    assert spi.get_out(IRQ) == 0, "kick wins pause, so half+slack should not trigger irq"
+
+    # now total is timeout+slack > timeout, so fire irq
+    await ClockCycles(dut.clk, 2**(WD_BASE_EXP-1))
+    assert spi.get_out(IRQ) == 1, "now total is timeout+slack, should fire irq"
+
+
+@cocotb.test()
+async def test_reset_from_any_state(dut):
+    """C6: rst_n returns to IDLE from any state.
+
+    test_reset_state only covers the power-up values. Reset is applied here
+    from IDLE, from COUNTING, and from IDLE with IRQ_FLAG already sticky. The
+    last is the only path that proves reset clears the flag: a W1C write is
+    the only other way to clear it, so nothing else exercises that reset.
+    """
+    spi = await setup(dut, "reset from any state")
+
+    async def pulse_reset():
+        """Hold rst_n low long enough to take, then release and settle.
+
+        A single clk of reset is not enough -- the value has to propagate, and
+        the outputs need time to settle before they are read. Reads must also
+        wait for the release: while rst_n is low spi_regs holds rx and cnt
+        cleared, so no frame is received and read() returns 0 no matter what
+        the registers actually hold.
+        """
+        spi.dut.rst_n.value = 0
+        await ClockCycles(dut.clk, 10)
+        spi.dut.rst_n.value = 1
+        await ClockCycles(dut.clk, 5)
+
+    async def assert_cleared(where):
+        assert spi.get_out(IRQ) == 0, f"IRQ still set after reset from {where}"
+        assert await spi.read(ADDR_CTRL) == 0, f"CTRL not cleared from {where}"
+        assert await spi.read(ADDR_STATUS) == 0, f"STATUS not cleared from {where}"
+
+    # --- from IDLE ---
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=2))
+    await pulse_reset()
+    await assert_cleared("IDLE")
+
+    # --- from COUNTING ---
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=2))
+    await spi.pin_kick()
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "did not arm"
+    await pulse_reset()
+    await assert_cleared("COUNTING")
+
+    # --- from IDLE with IRQ_FLAG sticky ---
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    await spi.pin_kick()
+    await wait_for_irq(spi)
+    # Positive control: without it the final check would be clearing a flag
+    # that was never set in the first place.
+    assert spi.get_out(IRQ) == 1, "IRQ did not fire"
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "IRQ_FLAG not set"
+    await pulse_reset()
+    await assert_cleared("IDLE with IRQ_FLAG set")
+
+
+@cocotb.test()
+async def test_status_armed_is_read_only(dut):
+    """B6: STATUS bit 1 (ARMED) is read-only; writes to it are ignored.
+
+    Only wr_data[0] takes part in the W1C path, so writing 0x02 must leave
+    ARMED alone in either direction: it cannot arm the watchdog from IDLE, and
+    it cannot disarm it while counting.
+    """
+    spi = await setup(dut, "B6 ARMED is read-only")
+
+    # From IDLE: writing the ARMED bit must not arm anything.
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=3))
+    await spi.write(ADDR_STATUS, ST_ARMED)
+    assert not (await spi.read(ADDR_STATUS)) & ST_ARMED, "writing ARMED armed it"
+
+    # From COUNTING: writing it must not disarm either.
+    await spi.kick()
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "kick did not arm"
+    await spi.write(ADDR_STATUS, ST_ARMED)
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "writing ARMED disarmed it"
+
+    # And doing so must not have disturbed the flag beside it.
+    assert not (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "IRQ_FLAG changed"
+
+
+@cocotb.test()
+async def test_irq_en_release_keeps_flag(dut):
+    """G5: clearing IRQ_EN releases the IRQ pin but retains IRQ_FLAG.
+
+    test_irq_en_gates_pin only goes from IRQ_EN=0 to 1. The reverse matters
+    because IRQ is combinational from both: dropping IRQ_EN must take the pin
+    with it while leaving the sticky flag readable, so a later re-enable
+    surfaces the same pending interrupt.
+
+    Note CTRL is locked while counting, so IRQ_EN can only be changed once the
+    timeout has returned the machine to IDLE.
+    """
+    spi = await setup(dut, "G5 IRQ_EN release keeps the flag")
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    await spi.kick()
+    await wait_for_irq(spi)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "IRQ_FLAG not set"
+
+    # The timeout returned us to IDLE, so the whole of CTRL is writable again.
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=0, timeout=0))
+    assert spi.get_out(IRQ) == 0, "IRQ pin still high after clearing IRQ_EN"
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, \
+        "clearing IRQ_EN cleared the flag"
+
+    # Re-enabling surfaces the same pending flag; only a W1C clears it.
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    assert spi.get_out(IRQ) == 1, "IRQ pin did not return with IRQ_EN"
+    await spi.write(ADDR_STATUS, ST_IRQ_FLAG)
+    assert spi.get_out(IRQ) == 0, "W1C did not clear IRQ"
+
+
+@cocotb.test()
+async def test_unused_pins(dut):
+    """I1 + I3: uo_out[7:2] stay low, and ui_in[7:5] affect nothing.
+
+    I1 guards the output packing in project.v -- a mis-sized concatenation
+    would light up a spare pin. I3 guards the input pin map: driving the
+    unused inputs high must change nothing, which a typo'd index would break.
+
+    Both are folded into one test since neither needs a scenario of its own,
+    only a run of ordinary traffic to observe.
+    """
+    spi = await setup(dut, "I1/I3 unused pins")
+
+    def check_spare_outputs(where):
+        spare = int(dut.uo_out.value) >> 2
+        assert spare == 0, f"uo_out[7:2] = {spare:#04x} at {where}"
+
+    check_spare_outputs("reset")
+
+    # Drive the unused inputs high for the rest of the test.
+    for bit in (5, 6, 7):
+        spi.set_pin(bit, 1)
+
+    # A normal arm-and-fire cycle must behave exactly as it does elsewhere.
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    assert await spi.read(ADDR_CTRL) == ctrl_word(en=1, irq_en=1, timeout=0), \
+        "CTRL readback changed by the unused inputs"
+    check_spare_outputs("after CTRL write")
+
+    await spi.kick()
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "kick did not arm"
+    check_spare_outputs("armed")
+
+    await wait_for_irq(spi)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "timeout did not fire"
+    # IRQ is live here, so this also proves the spare bits are not just a
+    # copy of a stuck-low bus.
+    check_spare_outputs("IRQ asserted")
+
+
+@cocotb.test()
+async def test_all_timeout_selections(dut):
+    """D1-D4: each TIMEOUT selection fires on its own counter bit.
+
+    All four values are written and read back by test_ctrl_readback, and the
+    case statement in project.v reaches full line coverage because always @(*)
+    re-evaluates every branch. But only TIMEOUT=00 had ever been *timed*, so
+    swapping two branches of that case would not have failed a single test.
+
+    Each window is measured from the kick to the IRQ. TIMEOUT=11 is 2**14
+    clocks with WD_BASE_EXP=8, which is why this is RTL only -- against the
+    gate level build, where WD_BASE_EXP is 23, it would never finish.
+    """
+    spi = await setup(dut, "D1-D4 every timeout selection")
+
+    for sel, exp in TIMEOUTS:
+        # Reconfiguring needs IDLE: CTRL is locked to EN alone while counting.
+        await spi.write(ADDR_CTRL, 0)
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=sel))
+        assert await spi.read(ADDR_CTRL) == ctrl_word(en=1, irq_en=1, timeout=sel), \
+            f"TIMEOUT={sel} did not take"
+
+        # Clear any flag left by the previous selection, so the poll below
+        # cannot see a stale one.
+        await spi.write(ADDR_STATUS, ST_IRQ_FLAG)
+        assert spi.get_out(IRQ) == 0, f"IRQ still set before TIMEOUT={sel}"
+
+        await spi.kick()
+        start = cocotb.utils.get_sim_time(unit="ns")
+
+        # Half the window must not be enough -- this is what separates one
+        # selection from the next, and what a swapped case branch would break.
+        await ClockCycles(dut.clk, 2**(exp - 1))
+        assert spi.get_out(IRQ) == 0, \
+            f"TIMEOUT={sel} fired at half of 2^{exp}: window is too short"
+
+        # Poll out the remainder rather than calling wait_for_irq, which would
+        # wait a further full window from here and inflate the measurement.
+        for _ in range(2**exp):
+            if spi.get_out(IRQ):
+                break
+            await ClockCycles(dut.clk, 1)
+        else:
+            raise AssertionError(f"TIMEOUT={sel} never fired around 2^{exp}")
+        cycles = (cocotb.utils.get_sim_time(unit="ns") - start) / CLK_NS
+
+        want = 2**exp
+        dut._log.info(f"TIMEOUT={sel}: fired after ~{cycles:.0f} clocks (want ~{want})")
+        assert want * 0.9 < cycles < want * 1.1, \
+            f"TIMEOUT={sel} fired after {cycles:.0f} clocks, wanted ~{want}"
