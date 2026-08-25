@@ -218,8 +218,8 @@ async def test_frame_length_enforced(dut):
     known = ctrl_word(en=1, irq_en=1)
     await spi.write(ADDR_CTRL, known)
 
-    # A 9-bit and an 11-bit frame both try to clear CTRL, and both must fail.
-    for nbits in (9, 11):
+    # A frame with the wrong number of bits tries to clear CTRL, and must fail.
+    for nbits in (0, 9, 11, 26):
         await spi.write(ADDR_CTRL, 0, nbits=nbits)
         got = await spi.read(ADDR_CTRL)
         assert got == known, f"{nbits}-bit frame was accepted (CTRL={got:#04x})"
@@ -266,7 +266,7 @@ async def test_disable_clears_armed(dut):
 
 @cocotb.test()
 async def test_timeout_fires(dut):
-    """A real 2^23 timeout: IRQ asserts, the counter clears, ARMED drops."""
+    """A real 2^23 timeout: IRQ asserts, goes to IDLE, and sets the IRQ_FLAG."""
     spi = await setup(dut, "Timeout fires (2^23 clocks, this one is slow)")
 
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
@@ -290,9 +290,10 @@ async def test_timeout_fires(dut):
 
 @cocotb.test()
 async def test_irq_flag_sticky_and_w1c(dut):
-    """IRQ_FLAG survives a kick and clears only on a write-1-to-clear."""
+    """After a timeout, the IRQ_FLAG is sticky until cleared by writing 1"""
     spi = await setup(dut, "IRQ_FLAG stickiness")
 
+    # timeout, goes to IDLE state
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     await spi.kick()
     await wait_for_irq(spi)
@@ -307,8 +308,9 @@ async def test_irq_flag_sticky_and_w1c(dut):
     # Writing 0 to STATUS must not clear it either.
     await spi.write(ADDR_STATUS, 0)
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "write of 0 cleared the flag"
+    assert spi.get_out(IRQ) == 1, "IRQ deasserted on kick"
 
-    # Write 1 clears.
+    # Write 1 clears IRQ_FLAG
     await spi.write(ADDR_STATUS, ST_IRQ_FLAG)
     assert not (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "W1C did not clear"
     assert spi.get_out(IRQ) == 0, "IRQ still asserted after W1C"
@@ -316,10 +318,10 @@ async def test_irq_flag_sticky_and_w1c(dut):
 
 @cocotb.test()
 async def test_irq_en_gates_pin(dut):
-    """IRQ_EN gates the pin without affecting the underlying flag."""
+    """IRQ_EN gates the IRQ output pin, but the flag still sets."""
     spi = await setup(dut, "IRQ_EN gating")
 
-    # IRQ_EN=0: the flag sets but the pin stays low.
+    # IRQ_EN=0: the flag sets but the IRQ pin stays low.
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=0, timeout=0))
     await spi.kick()
     await ClockCycles(dut.clk, 2**WD_BASE_EXP + 2**WD_BASE_EXP // 4)
@@ -329,6 +331,7 @@ async def test_irq_en_gates_pin(dut):
     # Enabling IRQ_EN in IDLE exposes the already-set flag.
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     await ClockCycles(dut.clk, 5)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "flag did not set"
     assert spi.get_out(IRQ) == 1, "IRQ pin low after enabling IRQ_EN"
 
 
@@ -340,7 +343,8 @@ async def test_pause_freezes_counter(dut):
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     await spi.kick()
 
-    # Run part way, then freeze well past the point where it would have fired.
+    # Run for half the timeout limit, pause, then run for twice the timeout
+    # limit, it should not fire IRQ because pause stops the counter.
     await ClockCycles(dut.clk, 2**(WD_BASE_EXP - 1))
     spi.set_pin(PAUSE, 1)
     await ClockCycles(dut.clk, 2**WD_BASE_EXP * 2)
@@ -355,7 +359,7 @@ async def test_pause_freezes_counter(dut):
 
 @cocotb.test()
 async def test_kick_restarts_window(dut):
-    """A kick part way through the window restarts it from zero."""
+    """A kick during counting should restart the counter from zero."""
     spi = await setup(dut, "Kick restarts the window")
 
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
