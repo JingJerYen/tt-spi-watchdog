@@ -467,6 +467,64 @@ makes the coverage legible.
 
 Line coverage remains 100% on `spi_regs.v` and told us none of this.
 
+## Gate level scope
+
+Eleven tests are marked `rtl_only` in [test.py](../test/test.py) and skip when
+`GATES=yes`. Every one of them waits out a real timeout window, and the
+netlist carries the silicon exponent: one window is 2^23 clocks, and
+TIMEOUT=11 is 2^29. At gate level speeds that is hours for the shortest and
+weeks for the longest, well past any CI limit. Left in, the `gl_test` job
+would burn its six-hour timeout and fail without telling anyone anything.
+
+### What that leaves unverified, and why it is acceptable
+
+The skipped tests exercise the counter's high bits and the state machine's
+timing. Nothing else covers *those specific bits* at gate level. The argument
+that this is safe has three parts.
+
+**The logic is proven equivalent by other means.** A miswired 4:1 mux on
+`timeout_bit`, a mis-synthesised counter, an inverted priority — these are
+structural, and the flow checks them structurally: `netgen` LVS at step 64,
+plus the Yosys synthesis checks at steps 7 and 8. None of it needs
+simulation. What the open-source flow lacks is RTL-to-netlist logic
+equivalence checking (Conformal LEC, Formality), which in a commercial flow
+would close this gap outright and make gate level functional simulation
+largely redundant.
+
+**The data path is still exercised.** The ten tests that do run at gate level
+arm the watchdog and let the counter run; `test_kick_arms` and
+`test_kick_is_prior_to_pause`'s fast half both toggle it. Only the carry into
+bit 23 goes unobserved — and that carry is the same circuit as the carry into
+bit 6, which is exercised thoroughly. There is no mechanism by which only the
+high bits would fail.
+
+**Timing is closed with margin.** The remaining risk is a timing violation
+making the counter drop a beat, which simulation would not reliably catch
+anyway. Post-PnR STA reports zero violations across all nine corners, worst
+setup slack 11.31 ns against a 20 ns period and worst hold slack 0.1065 ns:
+
+| Corner | Hold slack | Setup slack | Violations |
+| --- | --- | --- | --- |
+| Overall | 0.1065 | 11.3113 | 0 |
+| `nom_ss_100C_1v60` | 0.8746 | 11.3460 | 0 |
+| `min_ff_n40C_1v95` | 0.1065 | 14.5292 | 0 |
+
+### What still confirms the absolute value
+
+Nothing in simulation proves 23 is 23 — only that the structure is right.
+That is checked on silicon during bring-up, by measuring the real 168 ms with
+a scope. This is the normal division of labour for a scaled parameter:
+simulation verifies structure, silicon verifies the constant.
+
+### The stronger alternative, not taken
+
+The clean fix is to make `WD_BASE_EXP` a module parameter rather than a
+`define`, synthesise a second netlist with it set to 8, and run the full suite
+against that. Both netlists go through the same flow, so it proves synthesis
+does not break the design while staying simulatable. It is not done here
+because the TinyTapeout CI hardens once; a second run would mean a parallel
+flow for verification only.
+
 ## Verification method
 
 Tests asserting that something *does not* happen — no write commits, the pin

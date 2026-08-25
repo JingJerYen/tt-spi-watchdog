@@ -23,7 +23,18 @@ CLK_NS = 20  # 50 MHz, matching the datasheet
 # The RTL build shrinks the timeout windows so they can be simulated; see
 # WD_BASE_EXP in the Makefile. Silicon uses 23. Gate level sim has the real
 # netlist, so it falls back to the silicon value.
-WD_BASE_EXP = int(os.environ.get("WD_BASE_EXP", 23 if os.environ.get("GATES") == "yes" else 8))
+GATES = os.environ.get("GATES") == "yes"
+WD_BASE_EXP = int(os.environ.get("WD_BASE_EXP", 23 if GATES else 8))
+
+# Tests that wait out a real timeout window are RTL only. The netlist carries
+# the silicon exponent, so one window is 2**23 clocks and TIMEOUT=11 is 2**29
+# -- hours to weeks of wall time at gate level speeds, well past any CI limit.
+#
+# Nothing is lost by skipping them there. Gate level simulation exists to show
+# the netlist still matches the RTL after synthesis and place-and-route, not to
+# re-verify function; the tests that stay cover the combinational logic and
+# registers, which is what synthesis could actually have broken.
+rtl_only = cocotb.test(skip=GATES)
 
 # Pin map
 SCLK, MOSI, CS_N, PAUSE, KICK = 0, 1, 2, 3, 4
@@ -264,7 +275,7 @@ async def test_disable_clears_armed(dut):
     assert not (await spi.read(ADDR_STATUS)) & ST_ARMED, "EN=0 left it armed"
 
 
-@cocotb.test()
+@rtl_only
 async def test_timeout_fires(dut):
     """A real 2^23 timeout: IRQ asserts, goes to IDLE, and sets the IRQ_FLAG."""
     spi = await setup(dut, "Timeout fires (2^23 clocks, this one is slow)")
@@ -288,7 +299,7 @@ async def test_timeout_fires(dut):
     assert not status & ST_ARMED, "should return to IDLE after timeout"
 
 
-@cocotb.test()
+@rtl_only
 async def test_irq_flag_sticky_and_w1c(dut):
     """After a timeout, the IRQ_FLAG is sticky until cleared by writing 1"""
     spi = await setup(dut, "IRQ_FLAG stickiness")
@@ -316,7 +327,7 @@ async def test_irq_flag_sticky_and_w1c(dut):
     assert spi.get_out(IRQ) == 0, "IRQ still asserted after W1C"
 
 
-@cocotb.test()
+@rtl_only
 async def test_irq_en_gates_pin(dut):
     """IRQ_EN gates the IRQ output pin, but the flag still sets."""
     spi = await setup(dut, "IRQ_EN gating")
@@ -335,7 +346,7 @@ async def test_irq_en_gates_pin(dut):
     assert spi.get_out(IRQ) == 1, "IRQ pin low after enabling IRQ_EN"
 
 
-@cocotb.test()
+@rtl_only
 async def test_pause_freezes_counter(dut):
     """PAUSE holds the counter, delaying the timeout."""
     spi = await setup(dut, "PAUSE freezes the counter")
@@ -357,7 +368,7 @@ async def test_pause_freezes_counter(dut):
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
 
 
-@cocotb.test()
+@rtl_only
 async def test_kick_restarts_window(dut):
     """A kick during counting should restart the counter from zero."""
     spi = await setup(dut, "Kick restarts the window")
@@ -383,7 +394,7 @@ async def test_kick_restarts_window(dut):
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
 
 
-@cocotb.test()
+@rtl_only
 async def test_kick_is_not_level_trigger(dut):
     """same as kick_restarts_window, but not pull down kick pin, so
     it should always timeout
@@ -406,7 +417,7 @@ async def test_kick_is_not_level_trigger(dut):
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
 
 
-@cocotb.test()
+@rtl_only
 async def test_kick_is_prior_to_pause(dut):
     """If kick and pause comes at the same cycle, kick wins"""
     spi = await setup(dut, "Kick is prior to pause")
@@ -437,7 +448,7 @@ async def test_kick_is_prior_to_pause(dut):
     assert spi.get_out(IRQ) == 1, "now total is timeout+slack, should fire irq"
 
 
-@cocotb.test()
+@rtl_only
 async def test_reset_from_any_state(dut):
     """C6: rst_n returns to IDLE from any state.
 
@@ -516,7 +527,7 @@ async def test_status_armed_is_read_only(dut):
     assert not (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "IRQ_FLAG changed"
 
 
-@cocotb.test()
+@rtl_only
 async def test_irq_en_release_keeps_flag(dut):
     """G5: clearing IRQ_EN releases the IRQ pin but retains IRQ_FLAG.
 
@@ -556,8 +567,10 @@ async def test_unused_pins(dut):
     would light up a spare pin. I3 guards the input pin map: driving the
     unused inputs high must change nothing, which a typo'd index would break.
 
-    Both are folded into one test since neither needs a scenario of its own,
-    only a run of ordinary traffic to observe.
+    This one runs at gate level too, deliberately: pin mapping and output
+    packing are exactly what place-and-route could disturb, and the checks
+    here need no timeout window. The IRQ-asserted sample lives in
+    test_unused_pins_under_irq, which does.
     """
     spi = await setup(dut, "I1/I3 unused pins")
 
@@ -571,7 +584,7 @@ async def test_unused_pins(dut):
     for bit in (5, 6, 7):
         spi.set_pin(bit, 1)
 
-    # A normal arm-and-fire cycle must behave exactly as it does elsewhere.
+    # A normal arm cycle must behave exactly as it does elsewhere.
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     assert await spi.read(ADDR_CTRL) == ctrl_word(en=1, irq_en=1, timeout=0), \
         "CTRL readback changed by the unused inputs"
@@ -581,14 +594,30 @@ async def test_unused_pins(dut):
     assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "kick did not arm"
     check_spare_outputs("armed")
 
+
+@rtl_only
+async def test_unused_pins_under_irq(dut):
+    """I1: uo_out[7:2] stay low even while IRQ is asserted.
+
+    Split from test_unused_pins because it needs a real timeout. Sampling the
+    spare bits with IRQ high proves they are not simply a bus that happens to
+    sit at zero.
+    """
+    spi = await setup(dut, "I1 unused outputs under IRQ")
+
+    for bit in (5, 6, 7):
+        spi.set_pin(bit, 1)
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+    await spi.kick()
     await wait_for_irq(spi)
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "timeout did not fire"
-    # IRQ is live here, so this also proves the spare bits are not just a
-    # copy of a stuck-low bus.
-    check_spare_outputs("IRQ asserted")
+
+    spare = int(dut.uo_out.value) >> 2
+    assert spare == 0, f"uo_out[7:2] = {spare:#04x} while IRQ asserted"
 
 
-@cocotb.test()
+@rtl_only
 async def test_all_timeout_selections(dut):
     """D1-D4: each TIMEOUT selection fires on its own counter bit.
 

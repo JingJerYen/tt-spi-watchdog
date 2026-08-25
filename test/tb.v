@@ -27,8 +27,27 @@ module tb ();
   wire VGND = 1'b0;
 `endif
 
-  // Replace tt_um_example with your module name:
+  // Shrink the timeout windows so they are simulatable: 2**8 clocks rather
+  // than the silicon 2**23, keeping the same structure at a length a
+  // simulator can reach.
+  //
+  // Keep this in step with WD_BASE_EXP in the Makefile, which passes the same
+  // number to Python. If they disagree, every timeout measurement is wrong.
+  //
+  // Gate level does not use this. That netlist was hardened with the silicon
+  // default and has no parameter left to override, so the instantiation below
+  // is compiled without it and the windows stay full length -- which is why
+  // the tests that wait one out are skipped when GATES=yes. See rtl_only in
+  // test.py.
+  parameter WD_BASE_EXP = 8;
+
+`ifdef GL_TEST
   tt_um_spi_watchdog user_project (
+`else
+  tt_um_spi_watchdog #(
+      .WD_BASE_EXP(WD_BASE_EXP)
+  ) user_project (
+`endif
 
       // Include power ports for the Gate Level test:
 `ifdef GL_TEST

@@ -5,7 +5,18 @@
 
 `default_nettype none
 
-module tt_um_spi_watchdog (
+module tt_um_spi_watchdog #(
+    // Timeout base exponent. 23 is the silicon value, giving the 168 ms ..
+    // 10.7 s range in the datasheet at 50 MHz. A testbench overrides it to
+    // shrink the windows to something simulatable; nothing else in the design
+    // depends on it.
+    //
+    // The Tiny Tapeout harness instantiates this module by name with a fixed
+    // port list and no parameter overrides, so the default here is what gets
+    // hardened. Only a testbench, or a second synthesis run of its own, can
+    // change it.
+    parameter WD_BASE_EXP = 23
+) (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
     input  wire [7:0] uio_in,   // IOs: Input path
@@ -110,15 +121,9 @@ module tt_um_spi_watchdog (
   // WD_BASE_EXP + 2*TIMEOUT. Selecting a bit rather than doing a
   // full-width magnitude compare keeps this to a 4:1 mux.
   //
-  // WD_BASE_EXP is 23 in silicon, giving the 168 ms .. 10.7 s range in
-  // the datasheet. A testbench can override it to shrink the windows to
-  // something simulatable; nothing else in the design depends on it.
+  // WD_BASE_EXP is a module parameter, declared above.
   // ------------------------------------------------------------------
-`ifndef WD_BASE_EXP
-  `define WD_BASE_EXP 23
-`endif
-  localparam WD_BASE_EXP = `WD_BASE_EXP;
-  localparam CNT_W       = WD_BASE_EXP + 7;
+  localparam CNT_W = WD_BASE_EXP + 7;
 
   reg [CNT_W-1:0] counter;
 

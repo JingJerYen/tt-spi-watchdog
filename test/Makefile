@@ -8,23 +8,24 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = project.v spi_regs.v
 
-# Shrink the watchdog timeouts so they are simulatable. The design uses 23
-# in silicon (168 ms .. 10.7 s at 50 MHz); 8 keeps the same structure with
-# windows of a few hundred cycles. Gate level sim uses the real netlist, so
-# this only applies to RTL.
-WD_BASE_EXP ?= 8
+# The simulation timeout exponent lives in tb.v. Python reads it from the
+# environment, so the two stay in step from one place.
+WD_BASE_EXP = 8
+export WD_BASE_EXP
 
 ifneq ($(GATES),yes)
 
 # RTL simulation:
 SIM_BUILD				= sim_build/rtl
-COMPILE_ARGS    += -DWD_BASE_EXP=$(WD_BASE_EXP)
-export WD_BASE_EXP
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
 
 else
 
 # Gate level simulation:
+# GATES must reach the Python side too: test.py skips the timeout tests and
+# picks the silicon WD_BASE_EXP from it. A make variable alone is not visible
+# to the simulator's environment.
+export GATES
 SIM_BUILD				= sim_build/gl
 COMPILE_ARGS    += -DGL_TEST
 COMPILE_ARGS    += -DFUNCTIONAL
