@@ -1,0 +1,46 @@
+# Unit-level tests for spi_regs.
+#
+# Separate from the main Makefile on purpose: this builds spi_regs alone, with
+# no watchdog and no chip wrapper, so tests can drive rd_data and watch the
+# wr_en handshake directly.
+#
+# There is no gate level netlist for a submodule, so there is no GATES branch
+# here. WD_BASE_EXP is likewise absent -- it belongs to the watchdog counter,
+# which is not part of this build.
+#
+#   make -f Makefile.spi                    # default geometry, AW=2 DW=7
+#   make -f Makefile.spi AW=3 DW=8          # sweep a different frame width
+#   make -f Makefile.spi SIM=verilator      # faster, supports coverage
+
+SIM ?= icarus
+FST ?= -fst
+TOPLEVEL_LANG ?= verilog
+SRC_DIR = $(PWD)/../src
+
+# Frame geometry. spi_regs is parameterised, so the same tests can run against
+# widths the chip itself never instantiates -- useful for the $clog2 sizing of
+# the bit counter
+AW ?= 2
+DW ?= 7
+
+SIM_BUILD = sim_build/spi_$(AW)_$(DW)
+
+VERILOG_SOURCES += $(SRC_DIR)/spi_regs.v
+VERILOG_SOURCES += $(PWD)/tb_spi.v
+
+COMPILE_ARGS += -I$(SRC_DIR)
+
+# Override the tb parameters, and hand the same numbers to Python so the tests
+# can compute frame layouts instead of hard-coding them.
+ifeq ($(SIM),verilator)
+EXTRA_ARGS += --timing -GAW=$(AW) -GDW=$(DW)
+else
+COMPILE_ARGS += -P tb_spi.AW=$(AW) -P tb_spi.DW=$(DW)
+endif
+export AW
+export DW
+
+TOPLEVEL = tb_spi
+COCOTB_TEST_MODULES = test_spi
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
