@@ -28,7 +28,7 @@ module tb ();
 `endif
 
   // Shrink the timeout windows so they are simulatable: 2**8 clocks rather
-  // than the silicon 2**23, keeping the same structure at a length a
+  // than the silicon 2**18, keeping the same structure at a length a
   // simulator can reach.
   //
   // Keep this in step with WD_BASE_EXP in the Makefile, which passes the same

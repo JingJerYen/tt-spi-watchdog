@@ -6,8 +6,8 @@
 `default_nettype none
 
 module tt_um_spi_watchdog #(
-    // Timeout base exponent. 23 is the silicon value, giving the 168 ms ..
-    // 10.7 s range in the datasheet at 50 MHz. A testbench overrides it to
+    // Timeout base exponent. 18 is the silicon value, giving the 5.24 ms ..
+    // 5.37 s range in the datasheet at 50 MHz. A testbench overrides it to
     // shrink the windows to something simulatable; nothing else in the design
     // depends on it.
     //
@@ -15,7 +15,7 @@ module tt_um_spi_watchdog #(
     // port list and no parameter overrides, so the default here is what gets
     // hardened. Only a testbench, or a second synthesis run of its own, can
     // change it.
-    parameter WD_BASE_EXP = 23
+    parameter WD_BASE_EXP = 18
 ) (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
@@ -96,11 +96,11 @@ module tt_um_spi_watchdog #(
   // Registers
   // ------------------------------------------------------------------
   reg       en, irq_en;
-  reg [1:0] timeout_sel;
+  reg [2:0] timeout_sel;
   reg       irq_flag;
   reg       armed;          // the state machine: 0 = IDLE, 1 = COUNTING
 
-  wire [6:0] ctrl_rd   = {3'b000, timeout_sel, irq_en, en};
+  wire [6:0] ctrl_rd   = {2'b00, timeout_sel, irq_en, en};
   wire [6:0] status_rd = {5'b0, armed, irq_flag};
 
   always @(*) begin
@@ -117,23 +117,32 @@ module tt_um_spi_watchdog #(
   // ------------------------------------------------------------------
   // Watchdog counter
   //
-  // Timeout fires on the rising edge of counter bit
-  // WD_BASE_EXP + 2*TIMEOUT. Selecting a bit rather than doing a
-  // full-width magnitude compare keeps this to a 4:1 mux.
+  // Timeout fires on the rising edge of a selected counter bit. Selecting a
+  // bit rather than doing a full-width magnitude compare keeps this to an
+  // 8:1 mux, at the cost of every window being a power of two.
+  //
+  // The offsets are not a straight 0..7. The low half steps by one to keep
+  // fine control where a real-time loop needs it, then the top three steps
+  // double up so the range still reaches ~5 s without spending sixteen
+  // selections on it. See the table in docs/info.md.
   //
   // WD_BASE_EXP is a module parameter, declared above.
   // ------------------------------------------------------------------
-  localparam CNT_W = WD_BASE_EXP + 7;
+  localparam CNT_W = WD_BASE_EXP + 11;
 
   reg [CNT_W-1:0] counter;
 
   reg timeout_bit;
   always @(*) begin
     case (timeout_sel)
-      2'd0:    timeout_bit = counter[WD_BASE_EXP];
-      2'd1:    timeout_bit = counter[WD_BASE_EXP + 2];
-      2'd2:    timeout_bit = counter[WD_BASE_EXP + 4];
-      default: timeout_bit = counter[WD_BASE_EXP + 6];
+      3'd0:    timeout_bit = counter[WD_BASE_EXP];
+      3'd1:    timeout_bit = counter[WD_BASE_EXP + 1];
+      3'd2:    timeout_bit = counter[WD_BASE_EXP + 2];
+      3'd3:    timeout_bit = counter[WD_BASE_EXP + 3];
+      3'd4:    timeout_bit = counter[WD_BASE_EXP + 4];
+      3'd5:    timeout_bit = counter[WD_BASE_EXP + 6];
+      3'd6:    timeout_bit = counter[WD_BASE_EXP + 8];
+      default: timeout_bit = counter[WD_BASE_EXP + 10];
     endcase
   end
 
@@ -168,7 +177,7 @@ module tt_um_spi_watchdog #(
     if (!rst_n) begin
       en          <= 1'b0;
       irq_en      <= 1'b0;
-      timeout_sel <= 2'd0;
+      timeout_sel <= 3'd0;
       irq_flag    <= 1'b0;
     end else begin
       // CTRL is only fully writable in IDLE; while counting, EN alone lands.
@@ -176,7 +185,7 @@ module tt_um_spi_watchdog #(
         en <= wr_data[0];
         if (!armed) begin
           irq_en      <= wr_data[1];
-          timeout_sel <= wr_data[3:2];
+          timeout_sel <= wr_data[4:2];
         end
       end
 

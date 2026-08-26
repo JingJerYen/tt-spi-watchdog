@@ -111,8 +111,8 @@ frame return `0x07f` and the A3/A9 test fail.
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
-| B1 | CTRL (addr 0) reads back `{3'b0, TIMEOUT, IRQ_EN, EN}` | [project.v:92](../src/project.v#L92) | [test.py:155](../test/test.py#L155) | PASS |
-| B2 | CTRL bits 6:4 are unimplemented and read as 0 | [project.v:92](../src/project.v#L92) | constant `3'b000` in the readback | WAIVE |
+| B1 | CTRL (addr 0) reads back `{2'b0, TIMEOUT, IRQ_EN, EN}` | [project.v:92](../src/project.v#L92) | [test.py:155](../test/test.py#L155) | PASS |
+| B2 | CTRL bits 6:5 are unimplemented and read as 0 | [project.v:103](../src/project.v#L103) | constant `2'b00` in the readback | WAIVE |
 | B3 | KICK (addr 1) is write-only and reads as 0 | [project.v:99](../src/project.v#L99) | [test.py:174](../test/test.py#L174) | PASS |
 | B4 | STATUS (addr 2) reads `{5'b0, ARMED, IRQ_FLAG}` | [project.v:93](../src/project.v#L93) | many | PASS |
 | B5 | Address 3 is unallocated: reads 0, writes ignored | [project.v:99](../src/project.v#L99) | read half covered at [test.py:175](../test/test.py#L175); write half undecodable | WAIVE |
@@ -120,8 +120,8 @@ frame return `0x07f` and the A3/A9 test fail.
 
 ### B2 — waived
 
-`ctrl_rd` is `{3'b000, timeout_sel, irq_en, en}`, a literal constant in the
-top three positions. There is no state behind those bits to get wrong.
+`ctrl_rd` is `{2'b00, timeout_sel, irq_en, en}`, a literal constant in the
+top two positions. There is no state behind those bits to get wrong.
 
 ### B5 — waived
 
@@ -149,7 +149,7 @@ Verified by mutation: adding a `wr_status && wr_data[1]` branch that sets
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
 | C1 | IDLE to COUNTING on KICK while EN=1 | [project.v:151-153](../src/project.v#L151-L153) | [test.py:191](../test/test.py#L191) | PASS |
-| C2 | KICK in IDLE with EN=0 is ignored | [project.v:141](../src/project.v#L141) | [test.py:185](../test/test.py#L185) | PASS |
+| C2 | KICK in IDLE with EN=0 is ignored | [project.v:139](../src/project.v#L139) | [test.py:185](../test/test.py#L185) | PASS |
 | C3 | KICK in COUNTING clears the counter, stays armed | [project.v:151-153](../src/project.v#L151-L153) | [test.py:361](../test/test.py#L361) | PASS |
 | C4 | Timeout returns to IDLE and sets IRQ_FLAG | [project.v:154-157](../src/project.v#L154-L157) | [test.py:287](../test/test.py#L287) | PASS |
 | C5 | Clearing EN returns to IDLE | [project.v:148-150](../src/project.v#L148-L150) | [test.py:264](../test/test.py#L264) | PASS |
@@ -194,34 +194,45 @@ pin-level constraint is deliberate — see [Two levels](#two-levels).
 
 | ID | Feature | RTL | Test | Status |
 | --- | --- | --- | --- | --- |
-| D1 | TIMEOUT=00 fires on counter bit `WD_BASE_EXP` | [project.v:128](../src/project.v#L128) | [test.py:268](../test/test.py#L268), [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
-| D2 | TIMEOUT=01 fires on counter bit `WD_BASE_EXP + 2` | [project.v:129](../src/project.v#L129) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
-| D3 | TIMEOUT=10 fires on counter bit `WD_BASE_EXP + 4` | [project.v:130](../src/project.v#L130) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
-| D4 | TIMEOUT=11 fires on counter bit `WD_BASE_EXP + 6` | [project.v:131](../src/project.v#L131) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D1 | TIMEOUT=000 fires on counter bit `WD_BASE_EXP` | [project.v:138](../src/project.v#L138) | [test.py:268](../test/test.py#L268), [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D2 | TIMEOUT=001 fires on counter bit `WD_BASE_EXP + 1` | [project.v:139](../src/project.v#L139) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D3 | TIMEOUT=010 fires on counter bit `WD_BASE_EXP + 2` | [project.v:140](../src/project.v#L140) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D4 | TIMEOUT=011 fires on counter bit `WD_BASE_EXP + 3` | [project.v:141](../src/project.v#L141) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D5 | TIMEOUT=100 fires on counter bit `WD_BASE_EXP + 4` | [project.v:142](../src/project.v#L142) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D6 | TIMEOUT=101 fires on counter bit `WD_BASE_EXP + 6` | [project.v:143](../src/project.v#L143) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D7 | TIMEOUT=110 fires on counter bit `WD_BASE_EXP + 8` | [project.v:144](../src/project.v#L144) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
+| D8 | TIMEOUT=111 fires on counter bit `WD_BASE_EXP + 10` | [project.v:145](../src/project.v#L145) | [test.py](../test/test.py) `test_all_timeout_selections` | PASS |
 
-### D1-D4 — every selection, timed
+### D1-D8 — every selection, timed
 
-All four TIMEOUT values were already *written and read back* by
+All eight TIMEOUT values were already *written and read back* by
 `test_ctrl_readback`, and the `case` at
-[project.v:127-133](../src/project.v#L127-L133) reaches full line coverage
+[project.v:136-146](../src/project.v#L136-L146) reaches full line coverage
 because `always @(*)` re-evaluates every branch. Only `sel=0` had ever been
 timed.
 
 `test_all_timeout_selections` measures each window from the kick to the IRQ
-and asserts it lands within 10% of `2**(WD_BASE_EXP + 2*sel)`. Measured:
-257, 1025, 4097 and 16385 clocks against 256, 1024, 4096 and 16384 — the
-extra cycle is the kick's own latency.
+and asserts it lands within 10% of `2**(WD_BASE_EXP + SEL_OFFSETS[sel])`.
+The offsets are `0,1,2,3,4,6,8,10`, not a straight `0..7`: the top three
+selections step by two so the range reaches ~5 s in silicon. Measured:
+257, 513, 1025, 2049, 4097, 16385, 65537 and 262145 clocks against 256, 512,
+1024, 2048, 4096, 16384, 65536 and 262144 — the extra cycle is the kick's own
+latency.
+
+`SEL_OFFSETS` in [test.py](../test/test.py) must stay in step with the `case`
+in project.v. It is written out rather than computed, so a change to one
+without the other shows up as a failed measurement instead of a silent pass.
 
 The half-window check before each measurement is what separates one selection
 from its neighbour; without it a window that fired early would still be inside
 the tolerance of a longer one.
 
-Verified by mutation: swapping the `2'd1` and `2'd2` branches fails this test,
+Verified by mutation: swapping the `3'd1` and `3'd2` branches fails this test,
 while `test_ctrl_readback` and `test_timeout_fires` both still pass — which is
 exactly the gap this row existed to close.
 
-This is RTL only. Against the gate level build, where `WD_BASE_EXP` is 23,
-TIMEOUT=11 would be 2^29 clocks and never finish.
+This is RTL only. Against the gate level build, where `WD_BASE_EXP` is 18,
+TIMEOUT=111 would be 2^28 clocks and never finish.
 
 ## E. KICK sources
 
@@ -472,7 +483,7 @@ Line coverage remains 100% on `spi_regs.v` and told us none of this.
 Eleven tests are marked `rtl_only` in [test.py](../test/test.py) and skip when
 `GATES=yes`. Every one of them waits out a real timeout window, and the
 netlist carries the silicon exponent: one window is 2^23 clocks, and
-TIMEOUT=11 is 2^29. At gate level speeds that is hours for the shortest and
+TIMEOUT=111 is 2^28. At gate level speeds that is hours for the shortest and
 weeks for the longest, well past any CI limit. Left in, the `gl_test` job
 would burn its six-hour timeout and fail without telling anyone anything.
 
@@ -542,7 +553,7 @@ specific way the row describes, confirm the test fails, restore.
 | H4 | Gate `do_kick` with `~pause` | yes |
 | I1 | Duplicate `irq` into a spare output bit | yes |
 | I3 | Repoint `pause` at `ui_in[5]` | yes |
-| D2-D4 | Swap two branches of the `timeout_bit` case | yes |
+| D2-D8 | Swap two branches of the `timeout_bit` case | yes |
 
 Two mutations that were *not* caught are recorded under J1: neither isolated a
 phase-dependent failure, which is part of why that row is waived.

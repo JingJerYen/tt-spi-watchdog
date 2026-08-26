@@ -16,7 +16,7 @@ SPI write or by a rising edge on a dedicated pin. If feeding stops, the
 watchdog asserts `IRQ` at the timeout, clears its counter and returns to idle.
 `IRQ` stays asserted until it is cleared explicitly.
 
-The timeout is one of four settings from 168 ms to 10.7 s at 50 MHz.
+The timeout is one of eight settings from 5.24 ms to 5.37 s at 50 MHz.
 
 
 ## How to test
@@ -36,7 +36,7 @@ The timeout is one of four settings from 168 ms to 10.7 s at 50 MHz.
 | `uo_out[7:2]`| Out | Unused, driven low                                            |
 | `uio[7:0]`   | —   | Unused                                                        |
 | `clk`        | In  | System clock. Timings below assume 50 MHz                     |
-| `rst_n`      | In  | Active low reset, see below                                   |
+| `rst_n`      | In  | Active low synchronous reset, see below                                   |
 
 `rst_n` clears the counter, the registers, `MISO` and `IRQ`.
 
@@ -81,18 +81,27 @@ Reads of `KICK` and of address 3 return 0. Writes to address 3 are ignored.
 | --- | ---------- | ----- | --------------------------------------------------- |
 | 0   | `EN`       | 0     | 1 = watchdog armed, 0 = disarmed and counter cleared |
 | 1   | `IRQ_EN`   | 0     | 1 = `IRQ_FLAG` is allowed to drive the `IRQ` pin     |
-| 3:2 | `TIMEOUT`  | 00    | Timeout selection, see table                        |
-| 6:4 | —          | 000   | Unimplemented, reads as 0                           |
+| 4:2 | `TIMEOUT`  | 000   | Timeout selection, see table                        |
+| 6:5 | —          | 00    | Unimplemented, reads as 0                           |
 
 `TIMEOUT` selects which counter bit marks the timeout, so the threshold is
-always a power of two.
+always a power of two. The mapping is not a straight `18 + TIMEOUT`; see the
+table.
 
 | `TIMEOUT` | Clocks | Timeout @ 50 MHz |
 | --------- | ------ | ---------------- |
-| 00        | 2^23   | 168 ms           |
-| 01        | 2^25   | 671 ms           |
-| 10        | 2^27   | 2.7 s            |
-| 11        | 2^29   | 10.7 s           |
+| 000       | 2^18   | 5.24 ms          |
+| 001       | 2^19   | 10.5 ms          |
+| 010       | 2^20   | 21.0 ms          |
+| 011       | 2^21   | 41.9 ms          |
+| 100       | 2^22   | 83.9 ms          |
+| 101       | 2^24   | 336 ms           |
+| 110       | 2^26   | 1.34 s           |
+| 111       | 2^28   | 5.37 s           |
+
+The five lowest selections step by one exponent, keeping fine control where a
+real-time control loop needs it. The top three step by two so the range still
+reaches roughly five seconds without spending sixteen selections to get there.
 
 #### `STATUS` (addr 2)
 
@@ -109,8 +118,8 @@ does.
 
 ### Watchdog behavior
 
-A 30-bit up-counter with a two-state machine. The timeout fires on counter bit
-`23 + 2 * TIMEOUT`.
+A 29-bit up-counter with a two-state machine. The timeout fires on the counter
+bit named by `TIMEOUT` in the table above, from bit 18 up to bit 28.
 
 ```mermaid
 stateDiagram-v2

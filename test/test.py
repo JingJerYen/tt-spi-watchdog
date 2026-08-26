@@ -7,7 +7,7 @@ Everything here drives and observes the design through its pins only, so the
 same tests run against the gate level netlist. Internal state is checked by
 reading the STATUS register back over SPI rather than by peeking at signals.
 
-The shortest timeout is 2^23 clocks, which is far too long to simulate for
+The shortest timeout is 2^18 clocks, which is far too long to simulate for
 every case. Only test_timeout_fires runs a real timeout to completion; the
 rest exercise the SPI and control paths, which are timeout independent.
 """
@@ -21,13 +21,13 @@ from cocotb.triggers import ClockCycles
 CLK_NS = 20  # 50 MHz, matching the datasheet
 
 # The RTL build shrinks the timeout windows so they can be simulated; see
-# WD_BASE_EXP in the Makefile. Silicon uses 23. Gate level sim has the real
+# WD_BASE_EXP in the Makefile. Silicon uses 18. Gate level sim has the real
 # netlist, so it falls back to the silicon value.
 GATES = os.environ.get("GATES") == "yes"
-WD_BASE_EXP = int(os.environ.get("WD_BASE_EXP", 23 if GATES else 8))
+WD_BASE_EXP = int(os.environ.get("WD_BASE_EXP", 18 if GATES else 8))
 
 # Tests that wait out a real timeout window are RTL only. The netlist carries
-# the silicon exponent, so one window is 2**23 clocks and TIMEOUT=11 is 2**29
+# the silicon exponent, so one window is 2**18 clocks and TIMEOUT=111 is 2**28
 # -- hours to weeks of wall time at gate level speeds, well past any CI limit.
 #
 # Nothing is lost by skipping them there. Gate level simulation exists to show
@@ -49,13 +49,22 @@ KICK_MAGIC = 0x5A
 ST_IRQ_FLAG = 1 << 0
 ST_ARMED = 1 << 1
 
+# Counter bit offset above WD_BASE_EXP for each TIMEOUT selection. Not a
+# straight 0..7: the top three selections step by two so the range reaches
+# ~5 s. Must match the case statement in project.v.
+SEL_OFFSETS = [0, 1, 2, 3, 4, 6, 8, 10]
+
 # Timeout selections: (CTRL field value, exponent)
-TIMEOUTS = [(sel, WD_BASE_EXP + 2 * sel) for sel in range(4)]
+TIMEOUTS = [(sel, WD_BASE_EXP + off) for sel, off in enumerate(SEL_OFFSETS)]
+
+# The longest selection, used wherever a test needs the dog to stay armed
+# across several SPI frames.
+SEL_MAX = 7
 
 
 def ctrl_word(en=0, irq_en=0, timeout=0):
-    """Pack a CTRL register value: {3'b0, TIMEOUT[1:0], IRQ_EN, EN}."""
-    return (en & 1) | ((irq_en & 1) << 1) | ((timeout & 3) << 2)
+    """Pack a CTRL register value: {2'b0, TIMEOUT[2:0], IRQ_EN, EN}."""
+    return (en & 1) | ((irq_en & 1) << 1) | ((timeout & 7) << 2)
 
 
 class SpiMaster:
@@ -241,9 +250,9 @@ async def test_ctrl_locked_while_counting(dut):
     """While counting, a CTRL write updates EN only."""
     spi = await setup(dut, "CTRL locking")
 
-    # TIMEOUT=3 is the longest window, so the dog stays armed across the
+    # SEL_MAX is the longest window, so the dog stays armed across the
     # several SPI frames this test needs.
-    start = ctrl_word(en=1, irq_en=1, timeout=3)
+    start = ctrl_word(en=1, irq_en=1, timeout=SEL_MAX)
     await spi.write(ADDR_CTRL, start)
     await spi.kick()
     assert (await spi.read(ADDR_STATUS)) & ST_ARMED
@@ -277,8 +286,8 @@ async def test_disable_clears_armed(dut):
 
 @rtl_only
 async def test_timeout_fires(dut):
-    """A real 2^23 timeout: IRQ asserts, goes to IDLE, and sets the IRQ_FLAG."""
-    spi = await setup(dut, "Timeout fires (2^23 clocks, this one is slow)")
+    """A real 2^18 timeout: IRQ asserts, goes to IDLE, and sets the IRQ_FLAG."""
+    spi = await setup(dut, "Timeout fires (2^18 clocks, this one is slow)")
 
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     await spi.kick()
@@ -373,7 +382,7 @@ async def test_kick_restarts_window(dut):
     """A kick during counting should restart the counter from zero."""
     spi = await setup(dut, "Kick restarts the window")
 
-    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=3))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=SEL_MAX))
     await spi.kick()
 
     # Feed at half the window, via the pin: a pin kick is ~12 clocks, where an
@@ -390,7 +399,7 @@ async def test_kick_restarts_window(dut):
         await spi.kick()
 
     # Now stop feeding and let it expire.
-    await wait_for_irq(spi, WD_BASE_EXP + 6)
+    await wait_for_irq(spi, WD_BASE_EXP + SEL_OFFSETS[SEL_MAX])
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG
 
 
@@ -479,12 +488,12 @@ async def test_reset_from_any_state(dut):
         assert await spi.read(ADDR_STATUS) == 0, f"STATUS not cleared from {where}"
 
     # --- from IDLE ---
-    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=2))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=SEL_MAX))
     await pulse_reset()
     await assert_cleared("IDLE")
 
     # --- from COUNTING ---
-    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=2))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=SEL_MAX))
     await spi.pin_kick()
     assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "did not arm"
     await pulse_reset()
@@ -513,7 +522,7 @@ async def test_status_armed_is_read_only(dut):
     spi = await setup(dut, "B6 ARMED is read-only")
 
     # From IDLE: writing the ARMED bit must not arm anything.
-    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=3))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=SEL_MAX))
     await spi.write(ADDR_STATUS, ST_ARMED)
     assert not (await spi.read(ADDR_STATUS)) & ST_ARMED, "writing ARMED armed it"
 
@@ -619,18 +628,18 @@ async def test_unused_pins_under_irq(dut):
 
 @rtl_only
 async def test_all_timeout_selections(dut):
-    """D1-D4: each TIMEOUT selection fires on its own counter bit.
+    """D1-D8: each TIMEOUT selection fires on its own counter bit.
 
-    All four values are written and read back by test_ctrl_readback, and the
+    All eight values are written and read back by test_ctrl_readback, and the
     case statement in project.v reaches full line coverage because always @(*)
-    re-evaluates every branch. But only TIMEOUT=00 had ever been *timed*, so
+    re-evaluates every branch. But only TIMEOUT=000 had ever been *timed*, so
     swapping two branches of that case would not have failed a single test.
 
-    Each window is measured from the kick to the IRQ. TIMEOUT=11 is 2**14
+    Each window is measured from the kick to the IRQ. TIMEOUT=111 is 2**18
     clocks with WD_BASE_EXP=8, which is why this is RTL only -- against the
-    gate level build, where WD_BASE_EXP is 23, it would never finish.
+    gate level build, where WD_BASE_EXP is 18, it would never finish.
     """
-    spi = await setup(dut, "D1-D4 every timeout selection")
+    spi = await setup(dut, "D1-D8 every timeout selection")
 
     for sel, exp in TIMEOUTS:
         # Reconfiguring needs IDLE: CTRL is locked to EN alone while counting.
