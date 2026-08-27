@@ -36,7 +36,8 @@ faster than it should.
 | `ui_in[7:5]` | In  | Unused                                                        |
 | `uo_out[0]`  | Out | `MISO` — SPI data out (this chip -> master)                   |
 | `uo_out[1]`  | Out | `IRQ` — watchdog timeout interrupt, active high               |
-| `uo_out[7:2]`| Out | Unused, driven low                                            |
+| `uo_out[2]`  | Out | `RST` — watchdog reset pulse, low for 2^19 cycles |
+| `uo_out[7:3]`| Out | Unused, driven low                                            |
 | `uio[7:0]`   | —   | Unused                                                        |
 | `clk`        | In  | System clock. Timings below assume 50 MHz                     |
 | `rst_n`      | In  | Active low synchronous reset, see below                                   |
@@ -140,7 +141,8 @@ what tells a timeout apart from an early kick.
 | Bit | Name        | Reset | Description                                    |
 | --- | ----------- | ----- | ---------------------------------------------- |
 | 2:0 | `PRESCALER` | 000   | Counter clock divider, see table               |
-| 6:3 | —           | 0000  | Unimplemented, reads as 0                      |
+|  3  | `RST_EN`    | 0     | 1 = send reset pulse one tick after timeout    |
+| 6:4 | —           | 000   | Unimplemented, reads as 0                      |
 
 `PRESCALER` divides the clock feeding the watchdog counter, so it scales every
 `TIMEOUT` setting by the same factor. It exists because the timeout table is

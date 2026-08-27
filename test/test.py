@@ -41,7 +41,7 @@ SCLK, MOSI, CS_N, PAUSE, KICK = 0, 1, 2, 3, 4
 MISO, IRQ = 0, 1
 
 # Register addresses
-ADDR_CTRL, ADDR_KICK, ADDR_STATUS = 0, 1, 2
+ADDR_CTRL, ADDR_KICK, ADDR_STATUS, ADDR_CTRL2 = 0, 1, 2, 3
 
 KICK_MAGIC = 0x5A
 
@@ -69,10 +69,20 @@ SEL_MAX = 7
 WINDOWS = [(1, 2), (2, 4), (3, 8)]
 
 
+# PRESCALER divides the counter clock by 2**sel, so it multiplies every
+# TIMEOUT window by the same factor. Must match the ps_tick case in project.v.
+PRESCALERS = list(range(8))
+
+
 def ctrl_word(en=0, irq_en=0, timeout=0, window=0):
     """Pack a CTRL register value: {WINDOW[1:0], TIMEOUT[2:0], IRQ_EN, EN}."""
     return ((en & 1) | ((irq_en & 1) << 1) | ((timeout & 7) << 2)
             | ((window & 3) << 5))
+
+
+def ctrl2_word(prescaler=0):
+    """Pack a CTRL2 register value: {4'b0, PRESCALER[2:0]}."""
+    return prescaler & 7
 
 
 class SpiMaster:
@@ -699,7 +709,7 @@ WIN_SEL = 2                       # TIMEOUT selection used by the window tests
 WIN_EXP = WD_BASE_EXP + SEL_OFFSETS[WIN_SEL]
 
 
-async def arm(spi, timeout=WIN_SEL, window=0, irq_en=1):
+async def arm(spi, timeout=WIN_SEL, window=0, irq_en=1, prescaler=0):
     """Configure from IDLE and take the first kick into COUNTING.
 
     Returns immediately after the kick, with the counter still near 0. The
@@ -713,6 +723,7 @@ async def arm(spi, timeout=WIN_SEL, window=0, irq_en=1):
     that were counting.
     """
     await spi.write(ADDR_CTRL, 0)
+    await spi.write(ADDR_CTRL2, ctrl2_word(prescaler))
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=irq_en, timeout=timeout,
                                          window=window))
     await spi.pin_kick()
@@ -954,3 +965,154 @@ async def test_window_thresholds(dut):
         assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, \
             f"WINDOW=T/{frac}: no timeout after a valid late feed"
         await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)
+
+
+# ---------------------------------------------------------------------------
+# H. PRESCALER
+# ---------------------------------------------------------------------------
+
+@cocotb.test()
+async def test_ctrl2_readback(dut):
+    """H1: CTRL2 holds PRESCALER and reads back; bits 6:3 are unimplemented.
+
+    Every one of the eight settings is written and read back, which is what
+    separates a real register from a constant. The last write proves the top
+    four bits are not storage: writing 1s there must not change what comes
+    back.
+    """
+    spi = await setup(dut, "H1 CTRL2 readback")
+
+    for sel in PRESCALERS:
+        await spi.write(ADDR_CTRL2, ctrl2_word(sel))
+        got = await spi.read(ADDR_CTRL2)
+        assert got == sel, f"PRESCALER={sel} read back {got}"
+
+    # Bits 6:4 are unimplemented and read as 0, so a full-width write leaves
+    # only the low four bits behind.
+    await spi.write(ADDR_CTRL2, 0x7F)
+    got = await spi.read(ADDR_CTRL2)
+    assert got == 0xF, f"CTRL2 unimplemented bits stored, read back {got:#04x}"
+
+
+@cocotb.test()
+async def test_ctrl2_locked_while_counting(dut):
+    """H2: CTRL2 is only writable in IDLE, matching CTRL.
+
+    Changing the divider mid-window would move the deadline out from under a
+    counter already partway to it, so the write has to be discarded rather
+    than deferred.
+    """
+    spi = await setup(dut, "H2 CTRL2 locking")
+
+    await arm(spi, timeout=SEL_MAX, prescaler=0)
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "did not arm"
+
+    await spi.write(ADDR_CTRL2, ctrl2_word(5))
+    assert await spi.read(ADDR_CTRL2) == 0, "PRESCALER changed while counting"
+
+    # Back in IDLE it takes again.
+    await spi.write(ADDR_CTRL, 0)
+    await spi.write(ADDR_CTRL2, ctrl2_word(5))
+    assert await spi.read(ADDR_CTRL2) == 5, "PRESCALER not writable in IDLE"
+
+
+@rtl_only
+async def test_prescaler_scales_window(dut):
+    """H3: PRESCALER=N multiplies the timeout window by 2**N.
+
+    Each window is measured from the kick to the IRQ, the same way
+    test_all_timeout_selections measures the TIMEOUT settings. The half-window
+    check before each measurement is what separates one divider from the next;
+    without it a window that fired early would still be inside the tolerance
+    of a longer one.
+
+    All eight settings fit in simulation at TIMEOUT=000, where the longest is
+    2**8 * 128 clocks.
+    """
+    spi = await setup(dut, "H3 PRESCALER scales the window")
+
+    for sel in PRESCALERS:
+        want = 2**WD_BASE_EXP * (2**sel)
+
+        await spi.write(ADDR_CTRL, 0)
+        await spi.write(ADDR_STATUS, ST_IRQ_FLAG | ST_EARLY_FLAG)
+        assert spi.get_out(IRQ) == 0, f"IRQ still set before PRESCALER={sel}"
+
+        await arm(spi, timeout=0, prescaler=sel)
+        start = cocotb.utils.get_sim_time(unit="ns")
+
+        # Half the window must not be enough. A divider that was ignored would
+        # fire here, since the undivided window is shorter than half of this
+        # one for every sel above 0.
+        await ClockCycles(dut.clk, want // 2)
+        assert spi.get_out(IRQ) == 0, \
+            f"PRESCALER={sel} fired at half of {want} clocks"
+
+        for _ in range(want):
+            if spi.get_out(IRQ):
+                break
+            await ClockCycles(dut.clk, 1)
+        assert spi.get_out(IRQ) == 1, \
+            f"PRESCALER={sel} never fired within {want} clocks"
+
+        elapsed = (cocotb.utils.get_sim_time(unit="ns") - start) // CLK_NS
+        assert 0.9 * want <= elapsed <= 1.15 * want, \
+            f"PRESCALER={sel}: {elapsed} clocks, expected about {want}"
+        dut._log.info(f"PRESCALER={sel}: fired after ~{elapsed} clocks "
+                      f"(want ~{want})")
+
+
+@rtl_only
+async def test_prescaler_scales_closed_window(dut):
+    """H4: the divider stretches the closed window along with the full one.
+
+    WINDOW decodes from the same counter the prescaler feeds, so both edges
+    have to move together. A kick just past the undivided T/2 boundary lands
+    well inside the divided one and must still be called early.
+    """
+    spi = await setup(dut, "H4 PRESCALER scales the closed window")
+
+    # WINDOW=01 closes the first half. With PRESCALER=2 the whole window is
+    # four times longer, so T/2 sits at 2 * 2**WIN_EXP.
+    undivided_half = 2**WIN_EXP // 2
+    await arm(spi, window=1, prescaler=2)
+
+    # Just past where the closed window would end without the divider.
+    await ClockCycles(dut.clk, undivided_half + 64)
+    await spi.pin_kick()
+
+    status = await spi.read(ADDR_STATUS)
+    assert status & ST_EARLY_FLAG, \
+        "closed window did not scale: kick past the undivided T/2 was accepted"
+    assert not status & ST_ARMED, "early kick stayed in COUNTING"
+
+
+@rtl_only
+async def test_prescaler_pause_holds_divider(dut):
+    """H5: PAUSE freezes the prescaler along with the counter.
+
+    The divider chain has its own state, so it has to stop where the counter
+    stops. If it kept running, the first counter step after PAUSE would land
+    at an arbitrary point in the divide sequence and the window would come out
+    short.
+    """
+    spi = await setup(dut, "H5 PAUSE holds the divider")
+
+    want = 2**WD_BASE_EXP * 4          # PRESCALER=2
+    await arm(spi, timeout=0, prescaler=2)
+
+    await ClockCycles(dut.clk, want // 2)
+    spi.set_pin(PAUSE, 1)
+    await ClockCycles(dut.clk, want)    # a full window's worth of paused time
+    assert spi.get_out(IRQ) == 0, "timeout fired while paused"
+    spi.set_pin(PAUSE, 0)
+
+    # The remaining half still has to run before the IRQ appears.
+    await ClockCycles(dut.clk, want // 4)
+    assert spi.get_out(IRQ) == 0, "window came out short after PAUSE"
+
+    for _ in range(want):
+        if spi.get_out(IRQ):
+            break
+        await ClockCycles(dut.clk, 1)
+    assert spi.get_out(IRQ) == 1, "timeout never fired after PAUSE released"

@@ -80,30 +80,47 @@ module tt_um_spi_watchdog #(
   end
   wire kick_pin_evt = kick_s1 & ~kick_s2;
 
-  localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2;
+  localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2, ADDR_CTRL2 = 2'd3;
 
   wire wr_ctrl   = wr_en & (wr_addr == ADDR_CTRL);
   wire wr_kick   = wr_en & (wr_addr == ADDR_KICK);
   wire wr_status = wr_en & (wr_addr == ADDR_STATUS);
+  wire wr_ctrl2  = wr_en & (wr_addr == ADDR_CTRL2);
 
   // ------------------------------------------------------------------
   // Registers
   // ------------------------------------------------------------------
-  reg       en, irq_en;
+  reg       en, irq_en, rst_en;
   reg [2:0] timeout_sel;
   reg [1:0] window_sel;
+  reg [2:0] prescaler;
   reg       irq_flag;
   reg       early_flag;
-  reg       armed;          // state machine: 0 = IDLE, 1 = COUNTING
+
+  reg [1:0] fsm_state;
+  reg [1:0] nxt_state;
+  localparam IDLE = 0;
+  localparam COUNTING = 1;
+  localparam RESET_WAIT = 2;
+  localparam RESET = 3;
+  reg [19:0] reset_counter; // 2^19 cycles @ 50MHz ~= 10.486 ms
+
+  // The state is the single source of truth for where the machine is. COUNTING
+  // means a window is open; RESET_WAIT means it is timing the delay before the
+  // reset pulse.
+  wire counting = (fsm_state == COUNTING);
+  wire waiting  = (fsm_state == RESET_WAIT);
 
   wire [6:0] ctrl_rd   = {window_sel, timeout_sel, irq_en, en};
-  wire [6:0] status_rd = {early_flag, armed, irq_flag};
+  wire [6:0] status_rd = {4'b0, early_flag, counting, irq_flag};
+  wire [6:0] ctrl2_rd  = {3'b0, rst_en, prescaler};
 
   always @(*) begin
     case (rd_addr)
       ADDR_CTRL:   rd_data = ctrl_rd;
       ADDR_STATUS: rd_data = status_rd;
-      default:     rd_data = 7'd0;              // KICK and addr 3 read back 0
+      ADDR_CTRL2:  rd_data = ctrl2_rd;
+      default:     rd_data = 7'd0;              // KICK reads back 0
     endcase
   end
 
@@ -123,6 +140,25 @@ module tt_um_spi_watchdog #(
   localparam CNT_W = WD_BASE_EXP + 11;
 
   reg [CNT_W-1:0] counter;
+
+  // PRESCALER divides the counter clock by 2^PRESCALER. ps_cnt runs one clock
+  // at a time; ps_tick is high on the last count before it wraps, and only
+  // then does counter advance.
+  reg [6:0] ps_cnt;
+
+  reg ps_tick;
+  always @(*) begin
+    case (prescaler)
+      3'd0:    ps_tick = 1'b1;             // /1: counter advances every clock
+      3'd1:    ps_tick = ps_cnt[0];        // /2
+      3'd2:    ps_tick = &ps_cnt[1:0];     // /4
+      3'd3:    ps_tick = &ps_cnt[2:0];     // /8
+      3'd4:    ps_tick = &ps_cnt[3:0];     // /16
+      3'd5:    ps_tick = &ps_cnt[4:0];     // /32
+      3'd6:    ps_tick = &ps_cnt[5:0];     // /64
+      default: ps_tick = &ps_cnt[6:0];     // /128
+    endcase
+  end
 
   // Offset of the timeout bit above WD_BASE_EXP. Both window edges read it.
   reg [3:0] hi_off;
@@ -161,48 +197,46 @@ module tt_um_spi_watchdog #(
   endgenerate
 
   wire in_closed = (window_sel != 2'd0) &
-                   ~above[WD_BASE_EXP + hi_off - window_sel];
-
-  // en updates on the next clock. clr_en forwards a CTRL write that clears
-  // EN, so en_now disarms the dog in the same clock the write lands.
-  wire clr_en     = wr_ctrl & ~wr_data[0];
-  wire en_now     = en & ~clr_en;
+                   ~above[WD_BASE_EXP + {28'd0, hi_off} - {30'd0, window_sel}];
 
   // An early kick is a kick inside the closed window. It sets EARLY_FLAG and
-  // returns the machine to IDLE.
-  //
-  // The armed term limits the check to COUNTING, so the first kick out of
-  // IDLE always feeds.
-  wire early_kick = kick_evt & en_now & armed & in_closed;
+  // returns the machine to IDLE. Restricting it to COUNTING is what lets the
+  // first kick out of IDLE always feed.
+  wire early_kick = kick_evt & en & counting & in_closed;
 
   // A kick beats a timeout in the same clock, as it does PAUSE.
   //
   // An early kick stops there: the ~early_kick term keeps it out of do_kick,
   // so the window restarts only on a kick inside the open window.
-  wire do_kick    = kick_evt & en_now & ~early_kick;
-  wire do_timeout = armed & timeout_bit & ~do_kick;
+  wire do_kick    = kick_evt & en & ~early_kick;
+  wire do_timeout = counting & timeout_bit & ~do_kick;
 
-  // The three events are mutually exclusive: do_kick includes ~early_kick,
-  // do_timeout includes ~do_kick. Order does not matter below.
-  //
-  // clr_cnt lists every reason to zero the counter. Add new events to it.
-  wire clr_cnt = !en_now | do_kick | do_timeout | early_kick;
-  wire inc_cnt = en_now & armed & ~pause & ~clr_cnt;
+  // A fault is a timeout or an early kick: both end the window and route
+  // through RESET_WAIT. Disabling ends it too, but goes straight to IDLE.
+  wire fault   = do_timeout | early_kick;
+  wire end_win = !en | fault;
 
-  // A feed sets ARMED. Everything else clears it.
-  wire set_armed = do_kick;
-  wire clr_armed = !en_now | do_timeout | early_kick;
+  // The window is live while COUNTING and not held by PAUSE, and again while
+  // RESET_WAIT times its delay out of the same counter.
+  wire running = waiting | (en & counting & ~pause & ~end_win & ~do_kick);
+
+  // Both counters advance together; ps_tick gates the slow one.
+  wire inc_cnt = running & ps_tick;
+
+  // Restart the counters on anything that ends the window, and on a feed.
+  wire clr_cnt = end_win | do_kick;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       counter <= {CNT_W{1'b0}};
-      armed   <= 1'b0;
+      ps_cnt  <= 7'd0;
     end else begin
-      if (clr_cnt)      counter <= {CNT_W{1'b0}};
-      else if (inc_cnt) counter <= counter + 1'b1;
+      if (clr_cnt)      ps_cnt <= 7'd0;
+      else if (running) ps_cnt <= ps_cnt + 1'b1;
 
-      if (set_armed)      armed <= 1'b1;
-      else if (clr_armed) armed <= 1'b0;
+      if (clr_cnt & ~waiting) counter <= {CNT_W{1'b0}};
+      else if (inc_cnt)       counter <= counter + 1'b1;
+
     end
   end
 
@@ -210,19 +244,27 @@ module tt_um_spi_watchdog #(
     if (!rst_n) begin
       en          <= 1'b0;
       irq_en      <= 1'b0;
+      rst_en      <= 1'b0;
       timeout_sel <= 3'd0;
       window_sel  <= 2'd0;
       irq_flag    <= 1'b0;
       early_flag  <= 1'b0;
+      prescaler   <= 3'd0;
     end else begin
       // IDLE: all of CTRL is writable. COUNTING: only EN lands.
       if (wr_ctrl) begin
         en <= wr_data[0];
-        if (!armed) begin
+        if (fsm_state == IDLE) begin
           irq_en      <= wr_data[1];
           timeout_sel <= wr_data[4:2];
           window_sel  <= wr_data[6:5];
         end
+      end
+
+      // CTRL2 follows the same rule as CTRL: only writable in IDLE.
+      if (wr_ctrl2 && fsm_state == IDLE) begin
+        prescaler <= wr_data[2:0];
+        rst_en <= wr_data[3];
       end
 
       // Both flags are sticky: a timeout or an early kick sets one, and a
@@ -239,8 +281,38 @@ module tt_um_spi_watchdog #(
     end
   end
 
-  wire irq  = irq_en & (irq_flag | early_flag);
+  always @(posedge clk) begin
+    if (!rst_n)
+      fsm_state <= IDLE;
+    else
+      fsm_state <= nxt_state;
+  end
 
-  assign uo_out = {6'b0, irq, miso};
+  always @(*) begin
+    case (fsm_state)
+      IDLE:       nxt_state = do_kick ? COUNTING : IDLE;
+      COUNTING:   nxt_state = !end_win ? COUNTING : (fault ? RESET_WAIT : IDLE);
+      // Hold for one prescaler tick, then release. RST_EN is frozen outside
+      // IDLE, so it still reads what was configured for this window. When
+      // RST_EN is clear there is no reset to delay.
+      RESET_WAIT: nxt_state = !(rst_en & (irq_flag | early_flag)) ? IDLE :
+                              counter[0] ? RESET : RESET_WAIT;
+      RESET:      nxt_state = (reset_counter[19] == 1) ? IDLE : RESET;
+      default: nxt_state = IDLE;
+    endcase
+  end
+
+  // in RESET state, reset_counter counts up to 2^19, then go to IDLE
+  always @(posedge clk) begin
+    if (!rst_n)
+      reset_counter <= 20'b0;
+    else
+      reset_counter <= (fsm_state == RESET) ? (reset_counter + 1) : 0;
+  end
+
+  wire irq  = irq_en & (irq_flag | early_flag);
+  wire wdt_rst = rst_en & (fsm_state == RESET);
+
+  assign uo_out = {5'b0, wdt_rst, irq, miso};
 
 endmodule
