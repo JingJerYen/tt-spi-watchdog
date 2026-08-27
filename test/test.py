@@ -48,6 +48,7 @@ KICK_MAGIC = 0x5A
 # STATUS bits
 ST_IRQ_FLAG = 1 << 0
 ST_ARMED = 1 << 1
+ST_EARLY_FLAG = 1 << 2
 
 # Counter bit offset above WD_BASE_EXP for each TIMEOUT selection. Not a
 # straight 0..7: the top three selections step by two so the range reaches
@@ -62,9 +63,16 @@ TIMEOUTS = [(sel, WD_BASE_EXP + off) for sel, off in enumerate(SEL_OFFSETS)]
 SEL_MAX = 7
 
 
-def ctrl_word(en=0, irq_en=0, timeout=0):
-    """Pack a CTRL register value: {2'b0, TIMEOUT[2:0], IRQ_EN, EN}."""
-    return (en & 1) | ((irq_en & 1) << 1) | ((timeout & 7) << 2)
+# WINDOW selections: (CTRL field value, how far the closed window reaches into
+# the timeout window). 00 disables the check; 01/10/11 close the first T/2, T/4
+# and T/8. Must match the in_closed decode in project.v.
+WINDOWS = [(1, 2), (2, 4), (3, 8)]
+
+
+def ctrl_word(en=0, irq_en=0, timeout=0, window=0):
+    """Pack a CTRL register value: {WINDOW[1:0], TIMEOUT[2:0], IRQ_EN, EN}."""
+    return ((en & 1) | ((irq_en & 1) << 1) | ((timeout & 7) << 2)
+            | ((window & 3) << 5))
 
 
 class SpiMaster:
@@ -676,3 +684,273 @@ async def test_all_timeout_selections(dut):
         dut._log.info(f"TIMEOUT={sel}: fired after ~{cycles:.0f} clocks (want ~{want})")
         assert want * 0.9 < cycles < want * 1.1, \
             f"TIMEOUT={sel} fired after {cycles:.0f} clocks, wanted ~{want}"
+
+
+# ----------------------------------------------------------------------
+# Windowed mode (CTRL[6:5] = WINDOW)
+#
+# A closed window has to be long enough to land a kick inside it, and the
+# whole timeout window has to be short enough to simulate. A pin kick is ~12
+# clocks against an SPI frame's ~130, so these tests feed through the pin and
+# work at TIMEOUT=2: with WD_BASE_EXP=8 that is T = 2**10 = 1024 clocks, whose
+# tightest closed window (T/8) is still 128 clocks wide.
+# ----------------------------------------------------------------------
+WIN_SEL = 2                       # TIMEOUT selection used by the window tests
+WIN_EXP = WD_BASE_EXP + SEL_OFFSETS[WIN_SEL]
+
+
+async def arm(spi, timeout=WIN_SEL, window=0, irq_en=1):
+    """Configure from IDLE and take the first kick into COUNTING.
+
+    Returns immediately after the kick, with the counter still near 0. The
+    caller times its own kick from here, so nothing may be inserted in
+    between: an SPI frame is ~130 clocks and would eat a measurable slice of
+    a window whose closed part is only 128 clocks wide. That is also why
+    ARMED is not checked here -- reading STATUS is exactly the frame we
+    cannot afford. The tests that care check it after their own kick.
+
+    The configuration write needs IDLE, so EN is cleared first for callers
+    that were counting.
+    """
+    await spi.write(ADDR_CTRL, 0)
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=irq_en, timeout=timeout,
+                                         window=window))
+    await spi.pin_kick()
+
+
+@rtl_only
+async def test_window_disabled_accepts_any_kick(dut):
+    """WINDOW=00: the closed window does not exist, so no kick is ever early.
+
+    The counter is swept across the positions that would be inside the T/2,
+    T/4 and T/8 closed windows if any of them were selected. All three must
+    simply feed the dog: ARMED stays set, EARLY_FLAG stays clear, and the
+    machine never leaves COUNTING.
+    """
+    spi = await setup(dut, "WINDOW=00 accepts any kick")
+
+    await arm(spi, window=0)
+
+    # Kick at 1/16, 1/8 and 1/4 of the window -- deep inside every closed
+    # window the design can select.
+    for frac in (16, 8, 4):
+        await ClockCycles(dut.clk, 2**WIN_EXP // frac)
+        await spi.pin_kick()
+        status = await spi.read(ADDR_STATUS)
+        assert not status & ST_EARLY_FLAG, f"kick at T/{frac} flagged as early"
+        assert status & ST_ARMED, f"kick at T/{frac} left COUNTING"
+        assert spi.get_out(IRQ) == 0, f"kick at T/{frac} raised IRQ"
+
+    # Those kicks really were feeds, not no-ops: stop feeding and the dog
+    # still times out normally.
+    await wait_for_irq(spi, WIN_EXP)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "timeout did not fire"
+
+
+@rtl_only
+async def test_early_kick_faults(dut):
+    """A kick inside the closed window sets EARLY_FLAG, disarms and drives IRQ.
+
+    This is the whole point of windowed mode: an early feed is a fault, so it
+    must not restart the window. The check after the fault proves exactly
+    that -- the machine is back in IDLE with the counter held at 0, so no
+    timeout follows however long we wait.
+    """
+    spi = await setup(dut, "early kick faults")
+
+    # T/2 closed. Kick at a quarter of the window, well inside it.
+    await arm(spi, window=1)
+    await ClockCycles(dut.clk, 2**WIN_EXP // 4)
+    assert spi.get_out(IRQ) == 0, "IRQ up before the early kick"
+    await spi.pin_kick()
+
+    status = await spi.read(ADDR_STATUS)
+    assert status & ST_EARLY_FLAG, "EARLY_FLAG not set by an early kick"
+    assert not status & ST_ARMED, "early kick did not return to IDLE"
+    assert not status & ST_IRQ_FLAG, "early kick also set IRQ_FLAG"
+    assert spi.get_out(IRQ) == 1, "EARLY_FLAG did not drive IRQ"
+
+    # Back in IDLE with the counter cleared: an early kick must not have
+    # restarted the window, so nothing fires no matter how long we wait.
+    await ClockCycles(dut.clk, 2**(WIN_EXP + 1))
+    status = await spi.read(ADDR_STATUS)
+    assert not status & ST_IRQ_FLAG, "a timeout ran on after the early kick"
+    assert not status & ST_ARMED, "the early kick restarted the window"
+
+    # W1C clears it and releases the pin.
+    await spi.write(ADDR_STATUS, ST_EARLY_FLAG)
+    assert not (await spi.read(ADDR_STATUS)) & ST_EARLY_FLAG, "W1C did not clear"
+    assert spi.get_out(IRQ) == 0, "IRQ still up after clearing EARLY_FLAG"
+
+
+@rtl_only
+async def test_late_kick_restarts_window(dut):
+    """A kick past the closed window is an ordinary feed.
+
+    The mirror image of test_early_kick_faults, and the reason the boundary
+    matters: outside the closed part the counter clears, ARMED stays set and
+    the full window starts again. Fed repeatedly just past the boundary, the
+    dog must never fire.
+    """
+    spi = await setup(dut, "late kick restarts the window")
+
+    # T/2 closed: feed just after the halfway point, three times over.
+    await arm(spi, window=1)
+    for i in range(3):
+        await ClockCycles(dut.clk, 2**WIN_EXP // 2 + 32)
+        status = await spi.read(ADDR_STATUS)
+        assert not status & ST_EARLY_FLAG, f"feed {i} in the open half was early"
+        assert not status & ST_IRQ_FLAG, f"timed out before feed {i}"
+        await spi.pin_kick()
+        assert (await spi.read(ADDR_STATUS)) & ST_ARMED, f"feed {i} disarmed"
+
+    # Each of those restarted the window from zero -- so a full window is
+    # still ahead of us, and only stopping the feeds ends it.
+    await wait_for_irq(spi, WIN_EXP)
+    status = await spi.read(ADDR_STATUS)
+    assert status & ST_IRQ_FLAG, "the dog never timed out after feeding stopped"
+    assert not status & ST_EARLY_FLAG, "a late feed set EARLY_FLAG"
+
+
+@rtl_only
+async def test_first_kick_never_early(dut):
+    """The kick that leaves IDLE is never early, at any WINDOW setting.
+
+    In IDLE the counter sits at 0, which is inside every closed window. If the
+    check applied there the first kick would fault instead of arming and the
+    machine could never start -- so the design gates it on ARMED. All three
+    window settings are checked because each decodes a different counter bit,
+    and every one of them reads 0 at that moment.
+    """
+    spi = await setup(dut, "first kick is never early")
+
+    for wsel, frac in WINDOWS:
+        # Straight out of reset / IDLE, with no delay before the kick: the
+        # counter is at 0, the worst case for the closed-window decode.
+        await spi.write(ADDR_CTRL, 0)
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=WIN_SEL,
+                                             window=wsel))
+        await spi.pin_kick()
+
+        status = await spi.read(ADDR_STATUS)
+        assert status & ST_ARMED, f"WINDOW=T/{frac}: first kick did not arm"
+        assert not status & ST_EARLY_FLAG, \
+            f"WINDOW=T/{frac}: first kick flagged as early"
+        assert spi.get_out(IRQ) == 0, f"WINDOW=T/{frac}: first kick raised IRQ"
+
+        # An SPI kick out of IDLE must behave the same way as a pin kick.
+        await spi.write(ADDR_CTRL, 0)
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=WIN_SEL,
+                                             window=wsel))
+        await spi.kick()
+        status = await spi.read(ADDR_STATUS)
+        assert status & ST_ARMED, f"WINDOW=T/{frac}: first SPI kick did not arm"
+        assert not status & ST_EARLY_FLAG, \
+            f"WINDOW=T/{frac}: first SPI kick flagged as early"
+
+
+@rtl_only
+async def test_status_flags_clear_independently(dut):
+    """The two W1C bits in STATUS are independent of each other.
+
+    They share a register and both drive IRQ, so a W1C built on the whole
+    write data rather than on the individual bits would clear both at once and
+    still pass every single-flag test. Setting both and clearing them one at a
+    time is what separates the two.
+    """
+    spi = await setup(dut, "IRQ_FLAG and EARLY_FLAG clear independently")
+
+    # Set EARLY_FLAG with a kick inside the closed T/2.
+    await arm(spi, window=1)
+    await ClockCycles(dut.clk, 2**WIN_EXP // 4)
+    await spi.pin_kick()
+    assert (await spi.read(ADDR_STATUS)) & ST_EARLY_FLAG, "EARLY_FLAG not set"
+
+    # Set IRQ_FLAG too, by letting a window run out. The early kick left us in
+    # IDLE, so re-arm -- with the window off, so the timeout is what fires.
+    #
+    # wait_for_irq is no use here: EARLY_FLAG already holds the IRQ pin up, so
+    # it would return before the timeout had happened. Wait out the window and
+    # read the flag itself instead.
+    await arm(spi, window=0)
+    await ClockCycles(dut.clk, 2**WIN_EXP + 2**WIN_EXP // 4)
+    status = await spi.read(ADDR_STATUS)
+    assert status & ST_IRQ_FLAG, "IRQ_FLAG not set by the timeout"
+    assert status & ST_EARLY_FLAG, "the timeout path cleared EARLY_FLAG"
+
+    # Clear IRQ_FLAG only. EARLY_FLAG survives and holds IRQ up on its own.
+    await spi.write(ADDR_STATUS, ST_IRQ_FLAG)
+    status = await spi.read(ADDR_STATUS)
+    assert not status & ST_IRQ_FLAG, "IRQ_FLAG W1C did not clear it"
+    assert status & ST_EARLY_FLAG, "clearing IRQ_FLAG also cleared EARLY_FLAG"
+    assert spi.get_out(IRQ) == 1, "IRQ dropped while EARLY_FLAG was still set"
+
+    # Now the other one, and only then does IRQ let go.
+    await spi.write(ADDR_STATUS, ST_EARLY_FLAG)
+    assert not (await spi.read(ADDR_STATUS)) & ST_EARLY_FLAG, \
+        "EARLY_FLAG W1C did not clear it"
+    assert spi.get_out(IRQ) == 0, "IRQ still up with both flags clear"
+
+    # And the same in the other order: EARLY_FLAG first, IRQ_FLAG left behind.
+    await arm(spi, window=1)
+    await ClockCycles(dut.clk, 2**WIN_EXP // 4)
+    await spi.pin_kick()
+    await arm(spi, window=0)
+    await ClockCycles(dut.clk, 2**WIN_EXP + 2**WIN_EXP // 4)
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "IRQ_FLAG not set"
+    await spi.write(ADDR_STATUS, ST_EARLY_FLAG)
+    status = await spi.read(ADDR_STATUS)
+    assert not status & ST_EARLY_FLAG, "EARLY_FLAG W1C did not clear it"
+    assert status & ST_IRQ_FLAG, "clearing EARLY_FLAG also cleared IRQ_FLAG"
+    assert spi.get_out(IRQ) == 1, "IRQ dropped while IRQ_FLAG was still set"
+
+
+@rtl_only
+async def test_window_thresholds(dut):
+    """T/2, T/4 and T/8 each close the fraction of the window they name.
+
+    All three settings decode the same way and differ only in which counter
+    bit they look at, so nothing above would notice if two of them were
+    swapped: a kick at T/16 is early under all three. Each setting is
+    therefore probed on both sides of its own boundary -- early just inside,
+    a normal feed just outside -- which no other threshold would satisfy.
+
+    The margin either side is a pin kick's own length plus the synchroniser
+    depth. Its rising edge is what the design times, and that edge lands a few
+    clocks into pin_kick, so the sample point is only approximately where the
+    delay put it.
+    """
+    spi = await setup(dut, "T/2, T/4 and T/8 thresholds")
+
+    margin = 32  # comfortably clear of the ~12 clock pin kick
+
+    for wsel, frac in WINDOWS:
+        boundary = 2**WIN_EXP // frac
+
+        # --- inside: just before the boundary, must fault ---
+        await arm(spi, window=wsel)
+        await ClockCycles(dut.clk, boundary - margin)
+        await spi.pin_kick()
+        status = await spi.read(ADDR_STATUS)
+        assert status & ST_EARLY_FLAG, \
+            f"WINDOW=T/{frac}: kick at {boundary - margin} was not early"
+        assert not status & ST_ARMED, \
+            f"WINDOW=T/{frac}: early kick stayed in COUNTING"
+        await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)
+
+        # --- outside: just after the boundary, must feed ---
+        await arm(spi, window=wsel)
+        await ClockCycles(dut.clk, boundary + margin)
+        await spi.pin_kick()
+        status = await spi.read(ADDR_STATUS)
+        assert not status & ST_EARLY_FLAG, \
+            f"WINDOW=T/{frac}: kick at {boundary + margin} was called early"
+        assert status & ST_ARMED, \
+            f"WINDOW=T/{frac}: kick past the boundary left COUNTING"
+
+        # That feed restarted the window, so the dog is still alive and only
+        # runs out once we stop.
+        await wait_for_irq(spi, WIN_EXP)
+        assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, \
+            f"WINDOW=T/{frac}: no timeout after a valid late feed"
+        await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)

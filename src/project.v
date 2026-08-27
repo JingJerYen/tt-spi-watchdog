@@ -6,15 +6,10 @@
 `default_nettype none
 
 module tt_um_spi_watchdog #(
-    // Timeout base exponent. 18 is the silicon value, giving the 5.24 ms ..
-    // 5.37 s range in the datasheet at 50 MHz. A testbench overrides it to
-    // shrink the windows to something simulatable; nothing else in the design
-    // depends on it.
-    //
-    // The Tiny Tapeout harness instantiates this module by name with a fixed
-    // port list and no parameter overrides, so the default here is what gets
-    // hardened. Only a testbench, or a second synthesis run of its own, can
-    // change it.
+    // Timeout base exponent. The eight settings span 2^18 .. 2^28 clocks.
+    // Testbenches lower it to shorten simulation.
+    // Minimum is 3: the closed-window index reaches WD_BASE_EXP - 3.
+    // Tiny Tapeout does not override parameters, so 18 is what ships.
     parameter WD_BASE_EXP = 18
 ) (
     input  wire [7:0] ui_in,    // Dedicated inputs
@@ -31,7 +26,7 @@ module tt_um_spi_watchdog #(
   assign uio_out = 8'b0;
   assign uio_oe  = 8'b0;
 
-  // List all unused inputs to prevent warnings
+  // Tie off unused inputs to avoid warnings
   wire _unused = &{ena, uio_in, ui_in[7:5], 1'b0};
 
   wire sclk    = ui_in[0];
@@ -43,8 +38,8 @@ module tt_um_spi_watchdog #(
   // ------------------------------------------------------------------
   // SPI register interface
   //
-  // Frame layout and the exact-length rule live in spi_regs; this module
-  // only sees committed register writes and a combinational read port.
+  // spi_regs handles the frame format and length rule, and hands this module
+  // finished writes plus a read port.
   // ------------------------------------------------------------------
   wire       wr_en;
   wire [1:0] wr_addr;
@@ -70,8 +65,7 @@ module tt_um_spi_watchdog #(
       .rd_data(rd_data)
   );
 
-  // KICK is a free-running asynchronous pin, so it needs its own
-  // synchroniser and edge detector.
+  // KICK is asynchronous. Synchronise it, then detect the rising edge.
   reg kick_s0, kick_s1, kick_s2;
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -97,79 +91,118 @@ module tt_um_spi_watchdog #(
   // ------------------------------------------------------------------
   reg       en, irq_en;
   reg [2:0] timeout_sel;
+  reg [1:0] window_sel;
   reg       irq_flag;
-  reg       armed;          // the state machine: 0 = IDLE, 1 = COUNTING
+  reg       early_flag;
+  reg       armed;          // state machine: 0 = IDLE, 1 = COUNTING
 
-  wire [6:0] ctrl_rd   = {2'b00, timeout_sel, irq_en, en};
-  wire [6:0] status_rd = {5'b0, armed, irq_flag};
+  wire [6:0] ctrl_rd   = {window_sel, timeout_sel, irq_en, en};
+  wire [6:0] status_rd = {early_flag, armed, irq_flag};
 
   always @(*) begin
     case (rd_addr)
       ADDR_CTRL:   rd_data = ctrl_rd;
       ADDR_STATUS: rd_data = status_rd;
-      default:     rd_data = 7'd0;              // KICK and addr 3 read as 0
+      default:     rd_data = 7'd0;              // KICK and addr 3 read back 0
     endcase
   end
 
-  // KICK: a rising edge on the pin, or an SPI write of 0x5A to addr 1.
+  // A kick is a rising edge on the KICK pin, or an SPI write of 0x5A
+  // to address 1.
   wire kick_evt = kick_pin_evt | (wr_kick & (wr_data == 7'h5A));
 
   // ------------------------------------------------------------------
   // Watchdog counter
   //
-  // Timeout fires on the rising edge of a selected counter bit. Selecting a
-  // bit rather than doing a full-width magnitude compare keeps this to an
-  // 8:1 mux, at the cost of every window being a power of two.
+  // Timeout fires when the selected counter bit goes 0 -> 1, so every window
+  // is a power of two and selecting one costs a single mux.
   //
-  // The offsets are not a straight 0..7. The low half steps by one to keep
-  // fine control where a real-time loop needs it, then the top three steps
-  // double up so the range still reaches ~5 s without spending sixteen
-  // selections on it. See the table in docs/info.md.
-  //
-  // WD_BASE_EXP is a module parameter, declared above.
+  // Bit offsets are 0,1,2,3,4,6,8,10. The top three step by 2, stretching the
+  // range to 2^28 clocks without needing 16 settings.
   // ------------------------------------------------------------------
   localparam CNT_W = WD_BASE_EXP + 11;
 
   reg [CNT_W-1:0] counter;
 
-  reg timeout_bit;
+  // Offset of the timeout bit above WD_BASE_EXP. Both window edges read it.
+  reg [3:0] hi_off;
   always @(*) begin
     case (timeout_sel)
-      3'd0:    timeout_bit = counter[WD_BASE_EXP];
-      3'd1:    timeout_bit = counter[WD_BASE_EXP + 1];
-      3'd2:    timeout_bit = counter[WD_BASE_EXP + 2];
-      3'd3:    timeout_bit = counter[WD_BASE_EXP + 3];
-      3'd4:    timeout_bit = counter[WD_BASE_EXP + 4];
-      3'd5:    timeout_bit = counter[WD_BASE_EXP + 6];
-      3'd6:    timeout_bit = counter[WD_BASE_EXP + 8];
-      default: timeout_bit = counter[WD_BASE_EXP + 10];
+      3'd0:    hi_off = 4'd0;
+      3'd1:    hi_off = 4'd1;
+      3'd2:    hi_off = 4'd2;
+      3'd3:    hi_off = 4'd3;
+      3'd4:    hi_off = 4'd4;
+      3'd5:    hi_off = 4'd6;
+      3'd6:    hi_off = 4'd8;
+      default: hi_off = 4'd10;
     endcase
   end
 
-  // A CTRL write clearing EN must disarm in the same cycle it lands,
-  // otherwise ARMED reads back stale for one clock.
+  // WD_BASE_EXP is a parameter, so this index folds into a mux.
+  wire timeout_bit = counter[WD_BASE_EXP + hi_off];
+
+  // WINDOW picks a threshold 1, 2 or 3 bits below the timeout bit, closing
+  // the first half, quarter or eighth of the window.
+  //
+  // above[i] = OR of counter[i] and every bit above it. It stays 0 until the
+  // counter reaches bit i, then stays 1 for the rest of the window.
+  // in_closed reads the entry at the threshold: 1 means the counter has not
+  // reached it yet.
+  //
+  // Cost: one OR chain plus a mux.
+  wire [CNT_W-1:0] above;
+  assign above[CNT_W-1] = counter[CNT_W-1];
+  genvar gi;
+  generate
+    for (gi = CNT_W - 2; gi >= 0; gi = gi - 1) begin : g_above
+      assign above[gi] = counter[gi] | above[gi+1];
+    end
+  endgenerate
+
+  wire in_closed = (window_sel != 2'd0) &
+                   ~above[WD_BASE_EXP + hi_off - window_sel];
+
+  // en updates on the next clock. clr_en forwards a CTRL write that clears
+  // EN, so en_now disarms the dog in the same clock the write lands.
   wire clr_en     = wr_ctrl & ~wr_data[0];
   wire en_now     = en & ~clr_en;
 
-  // KICK wins over the timeout, matching the PAUSE priority rule.
-  wire do_kick    = kick_evt & en_now;
+  // An early kick is a kick inside the closed window. It sets EARLY_FLAG and
+  // returns the machine to IDLE.
+  //
+  // The armed term limits the check to COUNTING, so the first kick out of
+  // IDLE always feeds.
+  wire early_kick = kick_evt & en_now & armed & in_closed;
+
+  // A kick beats a timeout in the same clock, as it does PAUSE.
+  //
+  // An early kick stops there: the ~early_kick term keeps it out of do_kick,
+  // so the window restarts only on a kick inside the open window.
+  wire do_kick    = kick_evt & en_now & ~early_kick;
   wire do_timeout = armed & timeout_bit & ~do_kick;
+
+  // The three events are mutually exclusive: do_kick includes ~early_kick,
+  // do_timeout includes ~do_kick. Order does not matter below.
+  //
+  // clr_cnt lists every reason to zero the counter. Add new events to it.
+  wire clr_cnt = !en_now | do_kick | do_timeout | early_kick;
+  wire inc_cnt = en_now & armed & ~pause & ~clr_cnt;
+
+  // A feed sets ARMED. Everything else clears it.
+  wire set_armed = do_kick;
+  wire clr_armed = !en_now | do_timeout | early_kick;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       counter <= {CNT_W{1'b0}};
       armed   <= 1'b0;
-    end else if (!en_now) begin
-      counter <= {CNT_W{1'b0}};                 // disarmed: held in IDLE
-      armed   <= 1'b0;
-    end else if (do_kick) begin
-      counter <= {CNT_W{1'b0}};                 // feed: restart the window
-      armed   <= 1'b1;
-    end else if (do_timeout) begin
-      counter <= {CNT_W{1'b0}};                 // fire, then back to IDLE
-      armed   <= 1'b0;
-    end else if (armed && !pause) begin
-      counter <= counter + 1'b1;
+    end else begin
+      if (clr_cnt)      counter <= {CNT_W{1'b0}};
+      else if (inc_cnt) counter <= counter + 1'b1;
+
+      if (set_armed)      armed <= 1'b1;
+      else if (clr_armed) armed <= 1'b0;
     end
   end
 
@@ -178,26 +211,35 @@ module tt_um_spi_watchdog #(
       en          <= 1'b0;
       irq_en      <= 1'b0;
       timeout_sel <= 3'd0;
+      window_sel  <= 2'd0;
       irq_flag    <= 1'b0;
+      early_flag  <= 1'b0;
     end else begin
-      // CTRL is only fully writable in IDLE; while counting, EN alone lands.
+      // IDLE: all of CTRL is writable. COUNTING: only EN lands.
       if (wr_ctrl) begin
         en <= wr_data[0];
         if (!armed) begin
           irq_en      <= wr_data[1];
           timeout_sel <= wr_data[4:2];
+          window_sel  <= wr_data[6:5];
         end
       end
 
-      // Sticky flag: set by the timeout, cleared only by W1C or rst_n.
+      // Both flags are sticky: a timeout or an early kick sets one, and a
+      // W1C write or rst_n clears it. The two W1C bits are separate.
       if (do_timeout)
         irq_flag <= 1'b1;
       else if (wr_status && wr_data[0])
         irq_flag <= 1'b0;
+
+      if (early_kick)
+        early_flag <= 1'b1;
+      else if (wr_status && wr_data[2])
+        early_flag <= 1'b0;
     end
   end
 
-  wire irq  = irq_flag & irq_en;
+  wire irq  = irq_en & (irq_flag | early_flag);
 
   assign uo_out = {6'b0, irq, miso};
 
