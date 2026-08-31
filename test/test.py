@@ -1116,3 +1116,179 @@ async def test_prescaler_pause_holds_divider(dut):
             break
         await ClockCycles(dut.clk, 1)
     assert spi.get_out(IRQ) == 1, "timeout never fired after PAUSE released"
+
+
+# ---------------------------------------------------------------------------
+# Reset output, uo_out[2]
+#
+# Nothing above ever drives this pin high. test_unused_pins asserts
+# uo_out[7:2] stays zero, which only holds because RST_EN defaults to 0 -- so
+# the pin gets covered as a spare, not as the functional output it is. These
+# tests set RST_EN and check the pulse itself.
+#
+# The RESET state runs a fixed 2**19 + 1 clocks. That count is hardwired
+# rather than scaled by WD_BASE_EXP, so a full pulse is slow however short
+# the simulated timeout is. Only test_reset_pulse_length sits through one;
+# the rest bail out as soon as they have seen what they check.
+# ---------------------------------------------------------------------------
+WDT_RST = 2               # uo_out[2], driven by wdt_rst in project.v
+RST_EN = 1 << 3           # CTRL2 bit 3
+
+# FSM encoding, for the tests below that watch fsm_state directly.
+IDLE, CLOSED, OPEN, RESET_WAIT, RESET = range(5)
+
+# reset_counter starts at 0 and the FSM leaves RESET once bit 19 sets, so the
+# state lasts one clock at each value 0 .. 2**19-1 plus one more at 2**19
+# while the exit is decoded.
+RESET_LEN = 2**19 + 1
+
+
+async def arm_for_reset(dut, rst_en=1, timeout=0, prescaler=0, irq_en=1):
+    """Arm the dog with RST_EN set, so the next timeout walks into RESET.
+
+    CTRL2 carries RST_EN and is writable only in IDLE, so it goes first.
+    """
+    spi = await setup(dut, f"reset output, RST_EN={rst_en}")
+    await spi.write(ADDR_CTRL2,
+                    ctrl2_word(prescaler) | (RST_EN if rst_en else 0))
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=irq_en, timeout=timeout))
+    await spi.kick()
+    return spi
+
+
+async def run_to_fault(dut, prescaler=0):
+    """Advance until the timeout fires and the FSM leaves the window."""
+    for _ in range(8 * (2**WD_BASE_EXP) * (2**prescaler)):
+        await ClockCycles(dut.clk, 1)
+        if int(dut.user_project.fsm_state.value) in (RESET_WAIT, RESET):
+            return
+    raise AssertionError("timeout never fired")
+
+
+async def wait_for_reset_state(dut, limit=100):
+    """Step from RESET_WAIT into RESET.
+
+    RESET_WAIT is one prescaler tick, so this is a short hop.
+    """
+    for _ in range(limit):
+        if int(dut.user_project.fsm_state.value) == RESET:
+            return
+        await ClockCycles(dut.clk, 1)
+    raise AssertionError("never reached RESET")
+
+
+@rtl_only
+async def test_reset_pin_asserts_on_timeout(dut):
+    """R1: with RST_EN set, a timeout drives uo_out[2] high and holds it.
+
+    The core gap: no other test ever sees this pin high.
+    """
+    spi = await arm_for_reset(dut, rst_en=1)
+
+    await run_to_fault(dut)
+    await wait_for_reset_state(dut)
+
+    assert spi.get_out(WDT_RST) == 1, \
+        "uo_out[2] low in RESET with RST_EN set"
+
+    # It must stay asserted, not glitch high for a single clock.
+    for _ in range(1000):
+        await ClockCycles(dut.clk, 1)
+        assert spi.get_out(WDT_RST) == 1, "uo_out[2] dropped while in RESET"
+
+
+@rtl_only
+async def test_reset_pin_gated_by_rst_en(dut):
+    """R2: RST_EN=0 keeps the pin low through the same timeout.
+
+    This is what test_unused_pins was implicitly relying on. Here it is
+    checked deliberately, with the dog actually timing out.
+    """
+    spi = await arm_for_reset(dut, rst_en=0)
+
+    await run_to_fault(dut)
+
+    # With RST_EN clear, RESET_WAIT falls straight back to IDLE and the FSM
+    # never enters RESET, so the pin has no path to go high.
+    for _ in range(2000):
+        await ClockCycles(dut.clk, 1)
+        assert spi.get_out(WDT_RST) == 0, "uo_out[2] high with RST_EN clear"
+        assert int(dut.user_project.fsm_state.value) != RESET, \
+            "entered RESET with RST_EN clear"
+
+    # The timeout still happened -- only the reset output was suppressed.
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, \
+        "timeout did not set IRQ_FLAG"
+
+
+@rtl_only
+async def test_reset_pulse_length(dut):
+    """R3: the pulse is 2**19 + 1 clocks, then the FSM returns to IDLE.
+
+    The slow one: it sits through a whole pulse. The others short-circuit,
+    so this is the only test paying the full cost.
+    """
+    spi = await arm_for_reset(dut, rst_en=1)
+
+    await run_to_fault(dut)
+    await wait_for_reset_state(dut)
+
+    # Bounded, so a stuck-high output fails here instead of hanging the run.
+    held = 0
+    while spi.get_out(WDT_RST):
+        await ClockCycles(dut.clk, 1)
+        held += 1
+        assert held <= RESET_LEN + 100, "reset pulse never ended"
+
+    dut._log.info(f"reset pulse held {held} clocks (want {RESET_LEN})")
+    assert held == RESET_LEN, f"pulse was {held} clocks, want {RESET_LEN}"
+    assert int(dut.user_project.fsm_state.value) == IDLE, "did not return to IDLE"
+    assert spi.get_out(WDT_RST) == 0, "uo_out[2] still high after RESET"
+
+
+@rtl_only
+async def test_rst_n_clears_reset_output(dut):
+    """R4: rst_n wins over an in-progress reset pulse.
+
+    A watchdog that kept driving its own reset line through a system reset
+    would latch the board into a loop.
+    """
+    spi = await arm_for_reset(dut, rst_en=1)
+
+    await run_to_fault(dut)
+    await wait_for_reset_state(dut)
+    assert spi.get_out(WDT_RST) == 1, "expected the pin high before rst_n"
+
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 5)
+
+    assert spi.get_out(WDT_RST) == 0, "uo_out[2] survived rst_n"
+    assert spi.get_out(IRQ) == 0, "IRQ survived rst_n"
+    assert int(dut.user_project.fsm_state.value) == IDLE, "not IDLE after rst_n"
+    assert await spi.read(ADDR_CTRL2) == 0, "CTRL2 survived rst_n"
+
+
+@rtl_only
+async def test_early_kick_drives_reset(dut):
+    """R5: an early kick reaches the reset output, not just the IRQ.
+
+    A too-early kick is a fault like a timeout and takes the same path
+    through RESET_WAIT. R1 covers the timeout entry; this covers the other.
+    """
+    spi = await setup(dut, "early kick drives the reset output")
+
+    # WIN_SEL is wide enough that an SPI frame fits inside the closed half.
+    # A pin kick is used for the same reason arm() does: it is ~12 clocks
+    # against a frame's ~130.
+    await spi.write(ADDR_CTRL2, ctrl2_word(0) | RST_EN)
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=WIN_SEL,
+                                         window=1))
+    await spi.pin_kick()                      # arms, opens the closed half
+
+    await ClockCycles(dut.clk, 2**WIN_EXP // 4)   # a quarter in, safely early
+    await spi.pin_kick()                      # too early -> fault
+
+    await wait_for_reset_state(dut, limit=200)
+    assert spi.get_out(WDT_RST) == 1, "early kick did not drive uo_out[2]"

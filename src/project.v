@@ -97,18 +97,22 @@ module tt_um_spi_watchdog #(
   reg       irq_flag;
   reg       early_flag;
 
-  reg [1:0] fsm_state;
-  reg [1:0] nxt_state;
-  localparam IDLE = 0;
-  localparam COUNTING = 1;
-  localparam RESET_WAIT = 2;
-  localparam RESET = 3;
+  // A window runs CLOSED then OPEN. A kick in CLOSED is too early; a kick in
+  // OPEN is a normal feed. Splitting them means the state says which half we
+  // are in, instead of a comparison buried in the kick logic.
+  reg [2:0] fsm_state;
+  reg [2:0] nxt_state;
+  localparam IDLE       = 3'd0;
+  localparam CLOSED     = 3'd1;
+  localparam OPEN       = 3'd2;
+  localparam RESET_WAIT = 3'd3;
+  localparam RESET      = 3'd4;
+
   reg [19:0] reset_counter; // 2^19 cycles @ 50MHz ~= 10.486 ms
 
-  // The state is the single source of truth for where the machine is. COUNTING
-  // means a window is open; RESET_WAIT means it is timing the delay before the
-  // reset pulse.
-  wire counting = (fsm_state == COUNTING);
+  wire closed   = (fsm_state == CLOSED);
+  wire open_win = (fsm_state == OPEN);
+  wire counting = closed | open_win;      // a window is running
   wire waiting  = (fsm_state == RESET_WAIT);
 
   wire [6:0] ctrl_rd   = {window_sel, timeout_sel, irq_en, en};
@@ -140,25 +144,6 @@ module tt_um_spi_watchdog #(
   localparam CNT_W = WD_BASE_EXP + 11;
 
   reg [CNT_W-1:0] counter;
-
-  // PRESCALER divides the counter clock by 2^PRESCALER. ps_cnt runs one clock
-  // at a time; ps_tick is high on the last count before it wraps, and only
-  // then does counter advance.
-  reg [6:0] ps_cnt;
-
-  reg ps_tick;
-  always @(*) begin
-    case (prescaler)
-      3'd0:    ps_tick = 1'b1;             // /1: counter advances every clock
-      3'd1:    ps_tick = ps_cnt[0];        // /2
-      3'd2:    ps_tick = &ps_cnt[1:0];     // /4
-      3'd3:    ps_tick = &ps_cnt[2:0];     // /8
-      3'd4:    ps_tick = &ps_cnt[3:0];     // /16
-      3'd5:    ps_tick = &ps_cnt[4:0];     // /32
-      3'd6:    ps_tick = &ps_cnt[5:0];     // /64
-      default: ps_tick = &ps_cnt[6:0];     // /128
-    endcase
-  end
 
   // Offset of the timeout bit above WD_BASE_EXP. Both window edges read it.
   reg [3:0] hi_off;
@@ -196,48 +181,72 @@ module tt_um_spi_watchdog #(
     end
   endgenerate
 
-  wire in_closed = (window_sel != 2'd0) &
+  // WINDOW = 0 disables the closed half entirely.
+  wire has_closed = (window_sel != 2'd0);
+
+  wire in_closed = has_closed &
                    ~above[WD_BASE_EXP + {28'd0, hi_off} - {30'd0, window_sel}];
 
-  // An early kick is a kick inside the closed window. It sets EARLY_FLAG and
-  // returns the machine to IDLE. Restricting it to COUNTING is what lets the
-  // first kick out of IDLE always feed.
-  wire early_kick = kick_evt & en & counting & in_closed;
+  // en updates on the next clock. clr_en forwards a CTRL write that clears
+  // EN, so en_now disarms the dog in the same clock the write lands.
+  wire clr_en     = wr_ctrl & ~wr_data[0];
+  wire en_now     = en & ~clr_en;
+
+  // The state decides what a kick means: in CLOSED it is too early, anywhere
+  // else it feeds. No ordering terms are needed -- the two cannot both fire
+  // because the machine is only ever in one state.
+  wire kick_ok    = kick_evt & en_now;
+  wire early_kick = kick_ok & closed;
+  wire do_kick    = kick_ok & ~closed;
 
   // A kick beats a timeout in the same clock, as it does PAUSE.
-  //
-  // An early kick stops there: the ~early_kick term keeps it out of do_kick,
-  // so the window restarts only on a kick inside the open window.
-  wire do_kick    = kick_evt & en & ~early_kick;
   wire do_timeout = counting & timeout_bit & ~do_kick;
 
-  // A fault is a timeout or an early kick: both end the window and route
-  // through RESET_WAIT. Disabling ends it too, but goes straight to IDLE.
-  wire fault   = do_timeout | early_kick;
-  wire end_win = !en | fault;
+  // The window counter runs while a window is open and nothing is stopping
+  // it. RESET_WAIT has its own tick, so this one only ever means "time into
+  // the current window".
+  wire running = counting & en_now & ~pause
+                 & ~do_timeout & ~early_kick & ~do_kick;
+  // Restart the counter whenever the window ends or restarts.
+  wire clr_cnt = !en_now | do_timeout | early_kick | do_kick;
 
-  // The window is live while COUNTING and not held by PAUSE, and again while
-  // RESET_WAIT times its delay out of the same counter.
-  wire running = waiting | (en & counting & ~pause & ~end_win & ~do_kick);
+  // PRESCALER divides the counter clock by 2^PRESCALER, so counter only
+  // advances on a prescaler tick. The divider itself is clk_div_pow2; this
+  // module only says when it may run and when its period restarts.
+  //
+  // It runs in two situations, and they have different reasons:
+  //   - a window is running, where the tick paces the watchdog counter
+  //   - RESET_WAIT, where one tick is the whole delay
+  // Everything else restarts the period, so a new window always begins on a
+  // full division period rather than a partial one.
+  wire ps_en  = running | waiting;
+  wire ps_clr = clr_cnt & ~waiting;   // RESET_WAIT keeps its phase
 
-  // Both counters advance together; ps_tick gates the slow one.
-  wire inc_cnt = running & ps_tick;
+  wire ps_tick;
 
-  // Restart the counters on anything that ends the window, and on a feed.
-  wire clr_cnt = end_win | do_kick;
+  clk_div_pow2 #(
+      .SEL_N(8)                       // /1 .. /128
+  ) u_prescaler (
+      .clk  (clk),
+      .rst_n(rst_n),
+      .sel  (prescaler),
+      .en   (ps_en),
+      .clr  (ps_clr),
+      .tick (ps_tick)
+  );
+
+  // clk_div_pow2 does not gate tick with en, so each user ANDs in its own run
+  // condition. running and waiting are mutually exclusive, so at most one of
+  // these fires on any clock.
+  wire inc_cnt   = running & ps_tick;
+
+  // RESET_WAIT holds for one prescaler tick before the reset pulse goes out.
+  wire wait_done = waiting & ps_tick;
 
   always @(posedge clk) begin
-    if (!rst_n) begin
-      counter <= {CNT_W{1'b0}};
-      ps_cnt  <= 7'd0;
-    end else begin
-      if (clr_cnt)      ps_cnt <= 7'd0;
-      else if (running) ps_cnt <= ps_cnt + 1'b1;
-
-      if (clr_cnt & ~waiting) counter <= {CNT_W{1'b0}};
-      else if (inc_cnt)       counter <= counter + 1'b1;
-
-    end
+    if (!rst_n)       counter <= {CNT_W{1'b0}};
+    else if (clr_cnt) counter <= {CNT_W{1'b0}};
+    else if (inc_cnt) counter <= counter + 1'b1;
   end
 
   always @(posedge clk) begin
@@ -290,13 +299,27 @@ module tt_um_spi_watchdog #(
 
   always @(*) begin
     case (fsm_state)
-      IDLE:       nxt_state = do_kick ? COUNTING : IDLE;
-      COUNTING:   nxt_state = !end_win ? COUNTING : (fault ? RESET_WAIT : IDLE);
+      // A feed starts a window. With WINDOW disabled there is no closed half,
+      // so go straight to OPEN and every kick counts as a feed.
+      IDLE:       nxt_state = do_kick ? (has_closed ? CLOSED : OPEN) : IDLE;
+
+      // A kick here is too early: flag it and go handle the reset. The window
+      // otherwise ends at the threshold, which opens it.
+      CLOSED:     nxt_state = !en_now  ? IDLE :
+                              early_kick ? RESET_WAIT :
+                              !in_closed ? OPEN : CLOSED;
+
+      // OPEN runs to the timeout. A kick here feeds and restarts the window.
+      OPEN:       nxt_state = !en_now  ? IDLE :
+                              do_timeout ? RESET_WAIT :
+                              do_kick ? (has_closed ? CLOSED : OPEN) : OPEN;
+
       // Hold for one prescaler tick, then release. RST_EN is frozen outside
       // IDLE, so it still reads what was configured for this window. When
       // RST_EN is clear there is no reset to delay.
       RESET_WAIT: nxt_state = !(rst_en & (irq_flag | early_flag)) ? IDLE :
-                              counter[0] ? RESET : RESET_WAIT;
+                              wait_done ? RESET : RESET_WAIT;
+
       RESET:      nxt_state = (reset_counter[19] == 1) ? IDLE : RESET;
       default: nxt_state = IDLE;
     endcase

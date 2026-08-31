@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v spi_regs.v
+PROJECT_SOURCES = project.v spi_regs.v clk_div_pow2.v
 
 # The simulation timeout exponent lives in tb.v. Python reads it from the
 # environment, so the two stay in step from one place.
