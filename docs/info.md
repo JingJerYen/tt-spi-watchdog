@@ -36,7 +36,7 @@ faster than it should.
 | `ui_in[7:5]` | In  | Unused                                                        |
 | `uo_out[0]`  | Out | `MISO` — SPI data out (this chip -> master)                   |
 | `uo_out[1]`  | Out | `IRQ` — watchdog timeout interrupt, active high               |
-| `uo_out[2]`  | Out | `RST` — watchdog reset pulse, low for 2^19 cycles |
+| `uo_out[2]`  | Out | `WDT_RST_N` — watchdog reset pulse, active low for 2^19 cycles |
 | `uo_out[7:3]`| Out | Unused, driven low                                            |
 | `uio[7:0]`   | —   | Unused                                                        |
 | `clk`        | In  | System clock. Timings below assume 50 MHz                     |

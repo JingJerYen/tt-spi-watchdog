@@ -588,10 +588,11 @@ async def test_irq_en_release_keeps_flag(dut):
 
 @cocotb.test()
 async def test_unused_pins(dut):
-    """I1 + I3: uo_out[7:2] stay low, and ui_in[7:5] affect nothing.
+    """I1 + I3: uo_out[7:3] stay low, wdt_rst idles high, ui_in[7:5] do nothing.
 
     I1 guards the output packing in project.v -- a mis-sized concatenation
-    would light up a spare pin. I3 guards the input pin map: driving the
+    would light up a spare pin. uo_out[2] is the active-low wdt_rst, so its
+    idle level is 1, not 0. I3 guards the input pin map: driving the
     unused inputs high must change nothing, which a typo'd index would break.
 
     This one runs at gate level too, deliberately: pin mapping and output
@@ -602,8 +603,9 @@ async def test_unused_pins(dut):
     spi = await setup(dut, "I1/I3 unused pins")
 
     def check_spare_outputs(where):
-        spare = int(dut.uo_out.value) >> 2
-        assert spare == 0, f"uo_out[7:2] = {spare:#04x} at {where}"
+        spare = int(dut.uo_out.value) >> 3
+        assert spare == 0, f"uo_out[7:3] = {spare:#04x} at {where}"
+        assert spi.get_out(WDT_RST) == 1, f"wdt_rst not idle-high at {where}"
 
     check_spare_outputs("reset")
 
@@ -624,7 +626,7 @@ async def test_unused_pins(dut):
 
 @rtl_only
 async def test_unused_pins_under_irq(dut):
-    """I1: uo_out[7:2] stay low even while IRQ is asserted.
+    """I1: uo_out[7:3] stay low even while IRQ is asserted.
 
     Split from test_unused_pins because it needs a real timeout. Sampling the
     spare bits with IRQ high proves they are not simply a bus that happens to
@@ -640,8 +642,9 @@ async def test_unused_pins_under_irq(dut):
     await wait_for_irq(spi)
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "timeout did not fire"
 
-    spare = int(dut.uo_out.value) >> 2
-    assert spare == 0, f"uo_out[7:2] = {spare:#04x} while IRQ asserted"
+    spare = int(dut.uo_out.value) >> 3
+    assert spare == 0, f"uo_out[7:3] = {spare:#04x} while IRQ asserted"
+    assert spi.get_out(WDT_RST) == 1, "wdt_rst asserted (low) by an IRQ"
 
 
 @rtl_only
@@ -1119,12 +1122,12 @@ async def test_prescaler_pause_holds_divider(dut):
 
 
 # ---------------------------------------------------------------------------
-# Reset output, uo_out[2]
+# Reset output, uo_out[2] -- ACTIVE LOW.
 #
-# Nothing above ever drives this pin high. test_unused_pins asserts
-# uo_out[7:2] stays zero, which only holds because RST_EN defaults to 0 -- so
-# the pin gets covered as a spare, not as the functional output it is. These
-# tests set RST_EN and check the pulse itself.
+# The pin idles high and drops to 0 only in the RESET state, so it can drive
+# an external MCU's RESET_N directly. Nothing above ever asserts it;
+# test_unused_pins only checks the idle level. These tests set RST_EN and
+# check the pulse itself.
 #
 # The RESET state runs a fixed 2**19 + 1 clocks. That count is hardwired
 # rather than scaled by WD_BASE_EXP, so a full pulse is slow however short
@@ -1135,7 +1138,7 @@ WDT_RST = 2               # uo_out[2], driven by wdt_rst in project.v
 RST_EN = 1 << 3           # CTRL2 bit 3
 
 # FSM encoding, for the tests below that watch fsm_state directly.
-IDLE, CLOSED, OPEN, RESET_WAIT, RESET = range(5)
+IDLE, EARLY, NORMAL, RESET_WAIT, RESET = range(5)
 
 # reset_counter starts at 0 and the FSM leaves RESET once bit 19 sets, so the
 # state lasts one clock at each value 0 .. 2**19-1 plus one more at 2**19
@@ -1179,27 +1182,27 @@ async def wait_for_reset_state(dut, limit=100):
 
 @rtl_only
 async def test_reset_pin_asserts_on_timeout(dut):
-    """R1: with RST_EN set, a timeout drives uo_out[2] high and holds it.
+    """R1: with RST_EN set, a timeout drives uo_out[2] low and holds it.
 
-    The core gap: no other test ever sees this pin high.
+    The core gap: no other test ever sees this pin asserted.
     """
     spi = await arm_for_reset(dut, rst_en=1)
 
     await run_to_fault(dut)
     await wait_for_reset_state(dut)
 
-    assert spi.get_out(WDT_RST) == 1, \
-        "uo_out[2] low in RESET with RST_EN set"
+    assert spi.get_out(WDT_RST) == 0, \
+        "uo_out[2] still high in RESET with RST_EN set"
 
-    # It must stay asserted, not glitch high for a single clock.
+    # It must stay asserted, not glitch for a single clock.
     for _ in range(1000):
         await ClockCycles(dut.clk, 1)
-        assert spi.get_out(WDT_RST) == 1, "uo_out[2] dropped while in RESET"
+        assert spi.get_out(WDT_RST) == 0, "uo_out[2] released while in RESET"
 
 
 @rtl_only
 async def test_reset_pin_gated_by_rst_en(dut):
-    """R2: RST_EN=0 keeps the pin low through the same timeout.
+    """R2: RST_EN=0 keeps the pin deasserted (high) through the same timeout.
 
     This is what test_unused_pins was implicitly relying on. Here it is
     checked deliberately, with the dog actually timing out.
@@ -1209,10 +1212,10 @@ async def test_reset_pin_gated_by_rst_en(dut):
     await run_to_fault(dut)
 
     # With RST_EN clear, RESET_WAIT falls straight back to IDLE and the FSM
-    # never enters RESET, so the pin has no path to go high.
+    # never enters RESET, so the pin has no path to go low.
     for _ in range(2000):
         await ClockCycles(dut.clk, 1)
-        assert spi.get_out(WDT_RST) == 0, "uo_out[2] high with RST_EN clear"
+        assert spi.get_out(WDT_RST) == 1, "uo_out[2] asserted with RST_EN clear"
         assert int(dut.user_project.fsm_state.value) != RESET, \
             "entered RESET with RST_EN clear"
 
@@ -1233,9 +1236,9 @@ async def test_reset_pulse_length(dut):
     await run_to_fault(dut)
     await wait_for_reset_state(dut)
 
-    # Bounded, so a stuck-high output fails here instead of hanging the run.
+    # Bounded, so a stuck-low output fails here instead of hanging the run.
     held = 0
-    while spi.get_out(WDT_RST):
+    while not spi.get_out(WDT_RST):
         await ClockCycles(dut.clk, 1)
         held += 1
         assert held <= RESET_LEN + 100, "reset pulse never ended"
@@ -1243,7 +1246,7 @@ async def test_reset_pulse_length(dut):
     dut._log.info(f"reset pulse held {held} clocks (want {RESET_LEN})")
     assert held == RESET_LEN, f"pulse was {held} clocks, want {RESET_LEN}"
     assert int(dut.user_project.fsm_state.value) == IDLE, "did not return to IDLE"
-    assert spi.get_out(WDT_RST) == 0, "uo_out[2] still high after RESET"
+    assert spi.get_out(WDT_RST) == 1, "uo_out[2] still low after RESET"
 
 
 @rtl_only
@@ -1257,14 +1260,14 @@ async def test_rst_n_clears_reset_output(dut):
 
     await run_to_fault(dut)
     await wait_for_reset_state(dut)
-    assert spi.get_out(WDT_RST) == 1, "expected the pin high before rst_n"
+    assert spi.get_out(WDT_RST) == 0, "expected the pin asserted before rst_n"
 
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 5)
 
-    assert spi.get_out(WDT_RST) == 0, "uo_out[2] survived rst_n"
+    assert spi.get_out(WDT_RST) == 1, "uo_out[2] still asserted after rst_n"
     assert spi.get_out(IRQ) == 0, "IRQ survived rst_n"
     assert int(dut.user_project.fsm_state.value) == IDLE, "not IDLE after rst_n"
     assert await spi.read(ADDR_CTRL2) == 0, "CTRL2 survived rst_n"
@@ -1291,4 +1294,4 @@ async def test_early_kick_drives_reset(dut):
     await spi.pin_kick()                      # too early -> fault
 
     await wait_for_reset_state(dut, limit=200)
-    assert spi.get_out(WDT_RST) == 1, "early kick did not drive uo_out[2]"
+    assert spi.get_out(WDT_RST) == 0, "early kick did not assert uo_out[2]"

@@ -113,7 +113,7 @@ module tt_um_spi_watchdog #(
   localparam EARLY     = 3'd1; // counting, below early threshold, feed dog cause irq
   localparam NORMAL       = 3'd2; // counting, normal region, feed dog resets counter
   localparam RESET_WAIT = 3'd3; // irq trigger, due to timeout from NORMAL or early feed from EARLY
-  localparam RESET      = 3'd4; // user not clear flags during RESET_WAIT, send reset pulse then back to IDLE
+  localparam RESET      = 3'd4; // send reset pulse then back to IDLE
 
   // frequently used states
   wire early   = (fsm_state == EARLY);
@@ -122,7 +122,7 @@ module tt_um_spi_watchdog #(
 
   // output pins
   wire irq  = irq_en & (irq_flag | early_flag);
-  wire wdt_rst = rst_en & (fsm_state == RESET);
+  wire wdt_rst = ~(fsm_state == RESET);
   assign uo_out = {5'b0, wdt_rst, irq, miso};
 
   // read internal registers
@@ -193,7 +193,7 @@ module tt_um_spi_watchdog #(
   wire inc_cnt;
 
   // prescaler clock : enable when needed to save power
-  wire ps_en  = counting | waiting;
+  wire ps_en  = (counting | waiting) & ~pause;
   wire ps_clr = clr_cnt & ~waiting;   // RESET_WAIT keeps its phase
   wire ps_tick;
 
