@@ -42,24 +42,21 @@ module clk_div_pow2 #(
 
   reg [CNT_W-1:0] cnt;
 
-  // Terminal count = "the low sel bits of cnt are all 1". all_ones[i] means
-  // every bit of cnt below i is 1, so all_ones[sel] is the terminal count;
-  // this needs no comparator. all_ones[0] = 1 makes sel = 0 divide by 1.
-  wire [SEL_N-1:0] all_ones;
-  assign all_ones[0] = 1'b1;
-  genvar gi;
+  wire [SEL_N-1:0] prefix_and;
+  assign prefix_and[0] = 1'b1;
+  genvar i;
   generate
-    for (gi = 1; gi < SEL_N; gi = gi + 1) begin : g_all_ones
-      assign all_ones[gi] = all_ones[gi-1] & cnt[gi-1];
+    for (i = 1; i < SEL_N; i = i+1) begin: prefix_calc
+      assign prefix_and[i] = prefix_and[i-1] & cnt[i-1];
     end
   endgenerate
 
-  assign tick = all_ones[sel];
+  assign tick = prefix_and[sel];
 
   always @(posedge clk) begin
-    if (!rst_n)    cnt <= {CNT_W{1'b0}};
-    else if (clr)  cnt <= {CNT_W{1'b0}};
-    else if (en)   cnt <= tick ? {CNT_W{1'b0}} : cnt + 1'b1;
+    if (!rst_n) cnt <= 0;
+    else if (clr) cnt <= 0;
+    else if (en) cnt <= tick ? 0 : (cnt+1'b1);
   end
 
 endmodule

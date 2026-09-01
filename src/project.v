@@ -8,7 +8,7 @@
 module tt_um_spi_watchdog #(
     // Timeout base exponent. The eight settings span 2^18 .. 2^28 clocks.
     // Testbenches lower it to shorten simulation.
-    // Minimum is 3: the closed-window index reaches WD_BASE_EXP - 3.
+    // Minimum is 3: the early-window index reaches WD_BASE_EXP - 3.
     // Tiny Tapeout does not override parameters, so 18 is what ships.
     parameter WD_BASE_EXP = 18
 ) (
@@ -69,15 +69,16 @@ module tt_um_spi_watchdog #(
   reg kick_s0, kick_s1, kick_s2;
   always @(posedge clk) begin
     if (!rst_n) begin
-      kick_s0 <= 1'b0;
-      kick_s1 <= 1'b0;
-      kick_s2 <= 1'b0;
+      kick_s0 <= 0;
+      kick_s1 <= 0;
+      kick_s2 <= 0;
     end else begin
       kick_s0 <= kick_pin;
       kick_s1 <= kick_s0;
       kick_s2 <= kick_s1;
     end
   end
+  // s1 is newer, s2 is older
   wire kick_pin_evt = kick_s1 & ~kick_s2;
 
   localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2, ADDR_CTRL2 = 2'd3;
@@ -90,31 +91,41 @@ module tt_um_spi_watchdog #(
   // ------------------------------------------------------------------
   // Registers
   // ------------------------------------------------------------------
-  reg       en, irq_en, rst_en;
-  reg [2:0] timeout_sel;
-  reg [1:0] window_sel;
-  reg [2:0] prescaler;
-  reg       irq_flag;
-  reg       early_flag;
+  reg       en; // writes 0 : force state to IDLE. writes 1 + kick : starts counting
+  reg       irq_en; // irq gating
+  reg       rst_en; // wdt_rst gating
 
-  // A window runs CLOSED then OPEN. A kick in CLOSED is too early; a kick in
-  // OPEN is a normal feed. Splitting them means the state says which half we
-  // are in, instead of a comparison buried in the kick logic.
+  reg [2:0] timeout_sel; // CTRL[4:2] TIMEOUT
+  reg [1:0] window_sel; // CTRL[6:5] WINDOW
+  reg [2:0] prescaler; // CTRL2[2:0] PRESCALER
+  reg       irq_flag; // STATUS[0] IRQ_FLAG
+  reg       early_flag; // STATUS[2] EARLY_FLAG
+
+  // two counters
+  localparam CNT_W = WD_BASE_EXP + 11;
+  reg [CNT_W-1:0] counter; // main counter
+  reg [19:0] reset_counter; // reset pulse lasts 2^19 cycles (@ 50MHz ~= 10.486 ms)
+
+  // state machine
   reg [2:0] fsm_state;
   reg [2:0] nxt_state;
-  localparam IDLE       = 3'd0;
-  localparam CLOSED     = 3'd1;
-  localparam OPEN       = 3'd2;
-  localparam RESET_WAIT = 3'd3;
-  localparam RESET      = 3'd4;
+  localparam IDLE       = 3'd0; // only in this state can user set CTRL, CTRL2
+  localparam EARLY     = 3'd1; // counting, below early threshold, feed dog cause irq
+  localparam NORMAL       = 3'd2; // counting, normal region, feed dog resets counter
+  localparam RESET_WAIT = 3'd3; // irq trigger, due to timeout from NORMAL or early feed from EARLY
+  localparam RESET      = 3'd4; // user not clear flags during RESET_WAIT, send reset pulse then back to IDLE
 
-  reg [19:0] reset_counter; // 2^19 cycles @ 50MHz ~= 10.486 ms
-
-  wire closed   = (fsm_state == CLOSED);
-  wire open_win = (fsm_state == OPEN);
-  wire counting = closed | open_win;      // a window is running
+  // frequently used states
+  wire early   = (fsm_state == EARLY);
+  wire counting = (fsm_state == EARLY) | (fsm_state == NORMAL);
   wire waiting  = (fsm_state == RESET_WAIT);
 
+  // output pins
+  wire irq  = irq_en & (irq_flag | early_flag);
+  wire wdt_rst = rst_en & (fsm_state == RESET);
+  assign uo_out = {5'b0, wdt_rst, irq, miso};
+
+  // read internal registers
   wire [6:0] ctrl_rd   = {window_sel, timeout_sel, irq_en, en};
   wire [6:0] status_rd = {4'b0, early_flag, counting, irq_flag};
   wire [6:0] ctrl2_rd  = {3'b0, rst_en, prescaler};
@@ -132,19 +143,6 @@ module tt_um_spi_watchdog #(
   // to address 1.
   wire kick_evt = kick_pin_evt | (wr_kick & (wr_data == 7'h5A));
 
-  // ------------------------------------------------------------------
-  // Watchdog counter
-  //
-  // Timeout fires when the selected counter bit goes 0 -> 1, so every window
-  // is a power of two and selecting one costs a single mux.
-  //
-  // Bit offsets are 0,1,2,3,4,6,8,10. The top three step by 2, stretching the
-  // range to 2^28 clocks without needing 16 settings.
-  // ------------------------------------------------------------------
-  localparam CNT_W = WD_BASE_EXP + 11;
-
-  reg [CNT_W-1:0] counter;
-
   // Offset of the timeout bit above WD_BASE_EXP. Both window edges read it.
   reg [3:0] hi_off;
   always @(*) begin
@@ -161,67 +159,42 @@ module tt_um_spi_watchdog #(
   end
 
   // WD_BASE_EXP is a parameter, so this index folds into a mux.
+  // this bit = 1 triggers timeout
   wire timeout_bit = counter[WD_BASE_EXP + hi_off];
 
-  // WINDOW picks a threshold 1, 2 or 3 bits below the timeout bit, closing
-  // the first half, quarter or eighth of the window.
-  //
-  // above[i] = OR of counter[i] and every bit above it. It stays 0 until the
-  // counter reaches bit i, then stays 1 for the rest of the window.
-  // in_closed reads the entry at the threshold: 1 means the counter has not
-  // reached it yet.
-  //
-  // Cost: one OR chain plus a mux.
-  wire [CNT_W-1:0] above;
-  assign above[CNT_W-1] = counter[CNT_W-1];
-  genvar gi;
+  // suffix_or[i] = | counter[CNT_W-1:i]
+  // suffix_or[i]===1 means the counter value is larger than 2^i
+  wire [CNT_W-1:0] suffix_or;
+  assign suffix_or[CNT_W-1] = counter[CNT_W-1];
+  genvar i;
   generate
-    for (gi = CNT_W - 2; gi >= 0; gi = gi - 1) begin : g_above
-      assign above[gi] = counter[gi] | above[gi+1];
+    for (i = CNT_W - 2; i >= 0; i = i-1) begin: suffix_calc
+      assign suffix_or[i] = suffix_or[i+1] | counter[i];
     end
   endgenerate
 
-  // WINDOW = 0 disables the closed half entirely.
-  wire has_closed = (window_sel != 2'd0);
-
-  wire in_closed = has_closed &
-                   ~above[WD_BASE_EXP + {28'd0, hi_off} - {30'd0, window_sel}];
+  // WINDOW = 0 means no early stage setting
+  wire has_early = (window_sel != 2'd0);
+  wire early_timeout = suffix_or[WD_BASE_EXP + {28'd0, hi_off} - {30'd0, window_sel}];
 
   // en updates on the next clock. clr_en forwards a CTRL write that clears
-  // EN, so en_now disarms the dog in the same clock the write lands.
+  // EN, so en_now disarms the dog in the same clock
   wire clr_en     = wr_ctrl & ~wr_data[0];
   wire en_now     = en & ~clr_en;
 
-  // The state decides what a kick means: in CLOSED it is too early, anywhere
-  // else it feeds. No ordering terms are needed -- the two cannot both fire
-  // because the machine is only ever in one state.
-  wire kick_ok    = kick_evt & en_now;
-  wire early_kick = kick_ok & closed;
-  wire do_kick    = kick_ok & ~closed;
+  wire valid_kick = kick_evt & en_now;
+  wire early_kick = valid_kick & early;
+  wire normal_kick = valid_kick & ~early;
 
   // A kick beats a timeout in the same clock, as it does PAUSE.
-  wire do_timeout = counting & timeout_bit & ~do_kick;
+  wire normal_timeout = counting & timeout_bit & ~normal_kick;
 
-  // The window counter runs while a window is open and nothing is stopping
-  // it. RESET_WAIT has its own tick, so this one only ever means "time into
-  // the current window".
-  wire running = counting & en_now & ~pause
-                 & ~do_timeout & ~early_kick & ~do_kick;
-  // Restart the counter whenever the window ends or restarts.
-  wire clr_cnt = !en_now | do_timeout | early_kick | do_kick;
+  wire clr_cnt;
+  wire inc_cnt;
 
-  // PRESCALER divides the counter clock by 2^PRESCALER, so counter only
-  // advances on a prescaler tick. The divider itself is clk_div_pow2; this
-  // module only says when it may run and when its period restarts.
-  //
-  // It runs in two situations, and they have different reasons:
-  //   - a window is running, where the tick paces the watchdog counter
-  //   - RESET_WAIT, where one tick is the whole delay
-  // Everything else restarts the period, so a new window always begins on a
-  // full division period rather than a partial one.
-  wire ps_en  = running | waiting;
+  // prescaler clock : enable when needed to save power
+  wire ps_en  = counting | waiting;
   wire ps_clr = clr_cnt & ~waiting;   // RESET_WAIT keeps its phase
-
   wire ps_tick;
 
   clk_div_pow2 #(
@@ -235,13 +208,12 @@ module tt_um_spi_watchdog #(
       .tick (ps_tick)
   );
 
-  // clk_div_pow2 does not gate tick with en, so each user ANDs in its own run
-  // condition. running and waiting are mutually exclusive, so at most one of
-  // these fires on any clock.
-  wire inc_cnt   = running & ps_tick;
-
-  // RESET_WAIT holds for one prescaler tick before the reset pulse goes out.
-  wire wait_done = waiting & ps_tick;
+  // counter control, kick precedes pause
+  // early kick : EARLY --> WAIT
+  // normal kick : NORMAL --> EARLY
+  // normal timeout : NORMAL --> WAIT
+  assign clr_cnt = early_kick | normal_kick | normal_timeout;
+  assign inc_cnt = counting & ps_tick & ~pause;
 
   always @(posedge clk) begin
     if (!rst_n)       counter <= {CNT_W{1'b0}};
@@ -249,6 +221,15 @@ module tt_um_spi_watchdog #(
     else if (inc_cnt) counter <= counter + 1'b1;
   end
 
+  // in RESET state, reset_counter holds wdt_rst low for 2^19 ps_ticks
+  always @(posedge clk) begin
+    if (!rst_n)
+      reset_counter <= 20'b0;
+    else
+      reset_counter <= (fsm_state == RESET) ? (reset_counter + 1) : 0;
+  end
+
+  // writes to CTRL, CTRL2
   always @(posedge clk) begin
     if (!rst_n) begin
       en          <= 1'b0;
@@ -260,7 +241,7 @@ module tt_um_spi_watchdog #(
       early_flag  <= 1'b0;
       prescaler   <= 3'd0;
     end else begin
-      // IDLE: all of CTRL is writable. COUNTING: only EN lands.
+      // CTRL::en is always writable, while other fields are only writable in IDLE
       if (wr_ctrl) begin
         en <= wr_data[0];
         if (fsm_state == IDLE) begin
@@ -270,15 +251,15 @@ module tt_um_spi_watchdog #(
         end
       end
 
-      // CTRL2 follows the same rule as CTRL: only writable in IDLE.
+      // CTRL2 follows the same rule as CTRL: only writable in IDLE
       if (wr_ctrl2 && fsm_state == IDLE) begin
         prescaler <= wr_data[2:0];
         rst_en <= wr_data[3];
       end
 
       // Both flags are sticky: a timeout or an early kick sets one, and a
-      // W1C write or rst_n clears it. The two W1C bits are separate.
-      if (do_timeout)
+      // W1C write or rst_n clears it
+      if (normal_timeout)
         irq_flag <= 1'b1;
       else if (wr_status && wr_data[0])
         irq_flag <= 1'b0;
@@ -290,6 +271,7 @@ module tt_um_spi_watchdog #(
     end
   end
 
+  // state machine
   always @(posedge clk) begin
     if (!rst_n)
       fsm_state <= IDLE;
@@ -299,43 +281,24 @@ module tt_um_spi_watchdog #(
 
   always @(*) begin
     case (fsm_state)
-      // A feed starts a window. With WINDOW disabled there is no closed half,
-      // so go straight to OPEN and every kick counts as a feed.
-      IDLE:       nxt_state = do_kick ? (has_closed ? CLOSED : OPEN) : IDLE;
+      IDLE: nxt_state = !valid_kick ? IDLE:
+                          has_early ? EARLY : NORMAL;
 
-      // A kick here is too early: flag it and go handle the reset. The window
-      // otherwise ends at the threshold, which opens it.
-      CLOSED:     nxt_state = !en_now  ? IDLE :
-                              early_kick ? RESET_WAIT :
-                              !in_closed ? OPEN : CLOSED;
+      EARLY: nxt_state = !en_now ? IDLE :
+                          kick_evt ? RESET_WAIT :
+                          early_timeout ? NORMAL : EARLY;
 
-      // OPEN runs to the timeout. A kick here feeds and restarts the window.
-      OPEN:       nxt_state = !en_now  ? IDLE :
-                              do_timeout ? RESET_WAIT :
-                              do_kick ? (has_closed ? CLOSED : OPEN) : OPEN;
+      NORMAL: nxt_state = !en_now ? IDLE :
+                          normal_timeout ? RESET_WAIT :
+                          !kick_evt ? NORMAL :
+                          has_early ? EARLY : NORMAL;
 
-      // Hold for one prescaler tick, then release. RST_EN is frozen outside
-      // IDLE, so it still reads what was configured for this window. When
-      // RST_EN is clear there is no reset to delay.
-      RESET_WAIT: nxt_state = !(rst_en & (irq_flag | early_flag)) ? IDLE :
-                              wait_done ? RESET : RESET_WAIT;
+      RESET_WAIT: nxt_state = !rst_en ? IDLE :
+                              ps_tick ? RESET : RESET_WAIT;
 
-      RESET:      nxt_state = (reset_counter[19] == 1) ? IDLE : RESET;
+      RESET: nxt_state = reset_counter[19] ? IDLE : RESET;
       default: nxt_state = IDLE;
     endcase
   end
-
-  // in RESET state, reset_counter counts up to 2^19, then go to IDLE
-  always @(posedge clk) begin
-    if (!rst_n)
-      reset_counter <= 20'b0;
-    else
-      reset_counter <= (fsm_state == RESET) ? (reset_counter + 1) : 0;
-  end
-
-  wire irq  = irq_en & (irq_flag | early_flag);
-  wire wdt_rst = rst_en & (fsm_state == RESET);
-
-  assign uo_out = {5'b0, wdt_rst, irq, miso};
 
 endmodule
