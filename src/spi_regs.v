@@ -64,6 +64,7 @@ module spi_regs #(
   // sampling (mismatching them races the final shift).
   reg sclk_s0, sclk_s1, sclk_s2;
   reg cs_n_s0, cs_n_s1, cs_n_s2;
+  reg mosi_s0, mosi_s1;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -73,6 +74,8 @@ module spi_regs #(
       cs_n_s0 <= 1'b1;
       cs_n_s1 <= 1'b1;
       cs_n_s2 <= 1'b1;
+      mosi_s0 <= 1'b0;
+      mosi_s1 <= 1'b0;
     end else begin
       sclk_s0 <= sclk;
       sclk_s1 <= sclk_s0;
@@ -80,6 +83,8 @@ module spi_regs #(
       cs_n_s0 <= cs_n;
       cs_n_s1 <= cs_n_s0;
       cs_n_s2 <= cs_n_s1;
+      mosi_s0 <= mosi;
+      mosi_s1 <= mosi_s0;
     end
   end
 
@@ -99,7 +104,7 @@ module spi_regs #(
     end else if (cs_n_rise) begin
       cnt <= {CNT_W{1'b0}};                    // frame consumed, re-arm
     end else if (sample) begin
-      rx <= {rx[FRAME_BITS-2:0], mosi};
+      rx <= {rx[FRAME_BITS-2:0], mosi_s1};
       if (cnt != CNT_MAX[CNT_W-1:0]) cnt <= cnt + 1'b1;  // saturate
     end
   end
@@ -126,9 +131,9 @@ module spi_regs #(
       rd_addr <= {AW{1'b0}};
     end else if (sample) begin
       if (cnt == {CNT_W{1'b0}})
-        rd_req <= mosi;                        // first bit is R/W
+        rd_req <= mosi_s1;                        // first bit is R/W
       else if (cnt <= AW[CNT_W-1:0])
-        rd_addr <= {rd_addr[AW-2:0], mosi};    // next AW bits are the address
+        rd_addr <= {rd_addr[AW-2:0], mosi_s1};    // next AW bits are the address
     end
   end
 
