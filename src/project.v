@@ -32,7 +32,7 @@ module tt_um_spi_watchdog #(
   wire sclk    = ui_in[0];
   wire mosi    = ui_in[1];
   wire cs_n    = ui_in[2];
-  wire pause   = ui_in[3];
+  wire pause_pin = ui_in[3];
   wire kick_pin = ui_in[4];
 
   // ------------------------------------------------------------------
@@ -80,6 +80,19 @@ module tt_um_spi_watchdog #(
   end
   // s1 is newer, s2 is older
   wire kick_pin_evt = kick_s1 & ~kick_s2;
+
+  // PAUSE is asynchronous. Sync it.
+  reg pause_s0, pause_s1;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      pause_s0 <= 0;
+      pause_s1 <= 0;
+    end else begin
+      pause_s0 <= pause_pin;
+      pause_s1 <= pause_s0;
+    end
+  end
+  wire pause = pause_s1;
 
   localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2, ADDR_CTRL2 = 2'd3;
 
