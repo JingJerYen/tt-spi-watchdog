@@ -1,0 +1,16 @@
+{
+  "signal": [
+    { "name": "KICK",      "wave": "0101|0..........." },
+    { "name": "fsm state", "wave": "3...|...4..6...5.", "data": ["NORMAL", "RESET_WAIT", "RESET", "IDLE"] },
+    { "name": "IRQ",       "wave": "0...|...1........" },
+    { "name": "WDT_RST_N", "wave": "1...|......0...1." },
+    {                      "node": "........A..B...C." }
+  ],
+  "edge": [
+    "A<->B grace: 2^16 clk (1.31 ms)",
+    "B<->C reset pulse: 2^19 clk (10.5 ms)"
+  ],
+  "head": { "text": "Fault sequence: kicks stop, IRQ warns, grace period, reset pulse" },
+  "foot": { "text": "A W1C write clearing all flags during the grace period returns to IDLE with no reset. IRQ stays high until W1C." },
+  "config": { "hscale": 2 }
+}

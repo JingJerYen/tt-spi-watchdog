@@ -1,7 +1,7 @@
 # Tiny Tapeout project information
 project:
   title:        "SPI-Configurable Watchdog Timer"      # Project title
-  author:       "Jing Jer, Yen"      # Your name
+  author:       "Jing-Jer Yen"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "A SPI-configurable watchdog timer implementation"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
