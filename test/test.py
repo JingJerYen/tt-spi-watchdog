@@ -1248,6 +1248,14 @@ async def test_reset_pulse_length(dut):
     assert int(dut.user_project.fsm_state.value) == IDLE, "did not return to IDLE"
     assert spi.get_out(WDT_RST) == 1, "uo_out[2] still low after RESET"
 
+    # The flags survive the pulse: the host it just reset can still read why
+    # it died, and only a W1C retires the evidence.
+    assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, \
+        "IRQ_FLAG lost across the reset pulse"
+    assert spi.get_out(IRQ) == 1, "IRQ dropped without a W1C"
+    await spi.write(ADDR_STATUS, ST_IRQ_FLAG)
+    assert spi.get_out(IRQ) == 0, "W1C did not release IRQ"
+
 
 @rtl_only
 async def test_rst_n_clears_reset_output(dut):
@@ -1295,3 +1303,270 @@ async def test_early_kick_drives_reset(dut):
 
     await wait_for_reset_state(dut, limit=200)
     assert spi.get_out(WDT_RST) == 0, "early kick did not assert uo_out[2]"
+
+
+# ---------------------------------------------------------------------------
+# FSM directed checks
+#
+# These watch fsm_state directly, so they are RTL only: the flattened netlist
+# has no named state register to probe.
+# ---------------------------------------------------------------------------
+STATE_NAMES = {0: "IDLE", 1: "EARLY", 2: "NORMAL", 3: "RESET_WAIT", 4: "RESET"}
+
+
+@rtl_only
+async def test_early_then_normal(dut):
+    """With WINDOW set, a kick lands in EARLY and the FSM walks into NORMAL."""
+    spi = await setup(dut, "EARLY -> NORMAL")
+    core = dut.user_project
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=1))
+    await spi.kick()
+    await ClockCycles(dut.clk, 5)
+    st = int(core.fsm_state.value)
+    assert st == EARLY, f"after kick expected EARLY, got {STATE_NAMES.get(st)}"
+    for _ in range(2**WD_BASE_EXP):
+        await ClockCycles(dut.clk, 1)
+        if int(core.fsm_state.value) == NORMAL:
+            break
+    else:
+        raise AssertionError("never reached NORMAL")
+    dut._log.info("EARLY -> NORMAL transition confirmed")
+
+
+@rtl_only
+async def test_window_disabled_skips_early(dut):
+    """WINDOW=0 arms straight into NORMAL and never touches EARLY."""
+    spi = await setup(dut, "WINDOW=0 skips EARLY")
+    core = dut.user_project
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=0))
+    await spi.kick()
+    for _ in range(200):
+        await ClockCycles(dut.clk, 1)
+        assert int(core.fsm_state.value) != EARLY, "entered EARLY with WINDOW=0"
+    assert int(core.fsm_state.value) == NORMAL, "should sit in NORMAL"
+    dut._log.info("WINDOW=0 bypasses EARLY as intended")
+
+
+@rtl_only
+async def test_kick_in_normal_restarts_early(dut):
+    """A feed in NORMAL restarts the window at EARLY."""
+    spi = await setup(dut, "feed in NORMAL restarts at EARLY")
+    core = dut.user_project
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=1))
+    await spi.kick()
+    for _ in range(2**WD_BASE_EXP):
+        await ClockCycles(dut.clk, 1)
+        if int(core.fsm_state.value) == NORMAL:
+            break
+    assert int(core.fsm_state.value) == NORMAL
+    await spi.kick()
+    await ClockCycles(dut.clk, 5)
+    st = int(core.fsm_state.value)
+    assert st == EARLY, \
+        f"feed in NORMAL should restart at EARLY, got {STATE_NAMES.get(st)}"
+    dut._log.info("feed in NORMAL restarts the window at EARLY")
+
+
+@rtl_only
+async def test_dropped_transitions_unreachable(dut):
+    """The FSM's dropped transitions really are impossible.
+
+    EARLY no longer tests normal_timeout and NORMAL no longer tests
+    early_kick. That is only safe if those combinations never occur.
+    """
+    spi = await setup(dut, "dropped transitions are unreachable")
+    core = dut.user_project
+    bad = []
+
+    async def watch(n):
+        for _ in range(n):
+            await ClockCycles(dut.clk, 1)
+            st = int(core.fsm_state.value)
+            if st == EARLY and int(core.normal_timeout.value):
+                bad.append(("normal_timeout in EARLY", cocotb.utils.get_sim_time()))
+            if st == NORMAL and int(core.early_kick.value):
+                bad.append(("early_kick in NORMAL", cocotb.utils.get_sim_time()))
+
+    for wsel in (1, 2, 3):
+        # full window, no kicks: exercises EARLY -> NORMAL -> timeout
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=wsel))
+        await spi.kick()
+        await watch(3 * 2**WD_BASE_EXP)
+        await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)
+
+        # kick early, inside EARLY
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=wsel))
+        await spi.kick()
+        await watch(20)
+        await spi.kick()
+        await watch(400)
+        await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)
+
+        # kick late, inside NORMAL, repeatedly
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0, window=wsel))
+        await spi.kick()
+        for _ in range(4):
+            await watch(2**WD_BASE_EXP // 2 + 40)
+            await spi.kick()
+        await watch(300)
+        await spi.write(ADDR_STATUS, ST_EARLY_FLAG | ST_IRQ_FLAG)
+
+    if bad:
+        dut._log.error(f"{len(bad)} violations: {bad[:5]}")
+    assert not bad, f"dropped transition was actually reachable: {bad[:5]}"
+
+
+# ---------------------------------------------------------------------------
+# RESET_WAIT grace period
+#
+# reset_counter clears on entry, then the FSM leaves once bit WD_BASE_EXP-2
+# sets: one clock at each value 0 .. 2**(WD_BASE_EXP-2). The grace period is
+# fixed in clk cycles -- neither the prescaler nor PAUSE changes it, and no
+# kick aborts it. The one escape is deliberate: a W1C STATUS write landing
+# inside the grace period drops the FSM back to IDLE and cancels the reset.
+# ---------------------------------------------------------------------------
+WAIT_LEN = 2**(WD_BASE_EXP - 2) + 1
+
+
+@rtl_only
+async def test_reset_wait_fixed_length(dut):
+    """The grace period is WAIT_LEN clocks for every prescaler setting."""
+    for ps in range(4):
+        spi = await setup(dut, f"RESET_WAIT length, prescaler={ps}")
+        await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=ps) | RST_EN)
+        await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
+        await spi.kick()
+        await run_to_fault(dut, prescaler=ps)
+
+        core = dut.user_project
+        held = 0
+        while int(core.fsm_state.value) == RESET_WAIT:
+            await ClockCycles(dut.clk, 1)
+            held += 1
+            assert held < 4 * WAIT_LEN, "stuck in RESET_WAIT (lockup)"
+
+        st = int(core.fsm_state.value)
+        dut._log.info(f"prescaler={ps}: held {held} clocks, then state={st}")
+        assert st == RESET, f"left RESET_WAIT into {STATE_NAMES.get(st)}"
+        assert held == WAIT_LEN, f"prescaler={ps}: held {held}, want {WAIT_LEN}"
+
+
+@rtl_only
+async def test_kick_ignored_in_reset_wait(dut):
+    """A kick during the grace period neither aborts nor delays the reset.
+
+    Chosen semantics: once the dog has declared a fault, a kick is no longer
+    trusted -- a runaway loop that still feeds must not save itself. The
+    deliberate escape is the W1C STATUS write, covered by
+    test_w1c_aborts_reset_wait. The pin also stays deasserted through the
+    grace period: irq warns first, the reset pulse comes only after
+    RESET_WAIT expires.
+    """
+    spi = await arm_for_reset(dut, rst_en=1)
+    await run_to_fault(dut)
+    core = dut.user_project
+    assert int(core.fsm_state.value) == RESET_WAIT, "expected to catch RESET_WAIT"
+
+    await spi.pin_kick()               # ~12 clocks, well inside the grace period
+
+    for _ in range(4 * WAIT_LEN):
+        if int(core.fsm_state.value) != RESET_WAIT:
+            break
+        assert spi.get_out(WDT_RST) == 1, "wdt_rst asserted during the grace period"
+        await ClockCycles(dut.clk, 1)
+    st = int(core.fsm_state.value)
+    assert st == RESET, f"kick diverted RESET_WAIT into {STATE_NAMES.get(st)}"
+
+
+@rtl_only
+async def test_w1c_aborts_reset_wait(dut):
+    """A W1C STATUS write landing inside the grace period cancels the reset.
+
+    An SPI frame (~130 clk) is longer than the RTL grace period (65 clk), so
+    the frame is launched while the window is still counting, timed so its
+    commit (CS_N rising, ~128 clk after launch) lands a few clocks into
+    RESET_WAIT. The state watcher proves the commit really fell inside the
+    grace period -- if the timing drifts, the test fails rather than passing
+    vacuously.
+    """
+    spi = await arm_for_reset(dut, rst_en=1)   # timeout=0: fault at 2**WD_BASE_EXP
+    core = dut.user_project
+
+    # Launch so the commit lands ~20 clocks into the grace period.
+    launch_at = 2**WD_BASE_EXP - 106
+    while int(core.counter.value) < launch_at:
+        await ClockCycles(dut.clk, 1)
+
+    seen = set()
+
+    async def watch_states():
+        while True:
+            seen.add(int(core.fsm_state.value))
+            await ClockCycles(dut.clk, 1)
+
+    watcher = cocotb.start_soon(watch_states())
+    await spi.write(ADDR_STATUS, ST_IRQ_FLAG | ST_EARLY_FLAG)
+    # The escape is level-based: the write clears the flag registers, and the
+    # FSM leaves on the cleared flags one clock later. Give it a few clocks.
+    await ClockCycles(dut.clk, 4)
+    watcher.kill()
+
+    assert RESET_WAIT in seen, "W1C frame missed the grace period (timing off)"
+    assert RESET not in seen, "reset fired before the W1C landed"
+    assert int(core.fsm_state.value) == IDLE, "W1C did not abort RESET_WAIT"
+    assert spi.get_out(IRQ) == 0, "IRQ still asserted after the abort"
+
+    for _ in range(300):
+        await ClockCycles(dut.clk, 1)
+        assert spi.get_out(WDT_RST) == 1, "reset pulse fired after the abort"
+    assert await spi.read(ADDR_STATUS) == 0, "flags survived the W1C"
+
+
+@rtl_only
+async def test_pause_does_not_stretch_reset_wait(dut):
+    """PAUSE freezes windows, not the grace period or the reset itself."""
+    spi = await arm_for_reset(dut, rst_en=1)
+    await run_to_fault(dut)
+    core = dut.user_project
+    assert int(core.fsm_state.value) == RESET_WAIT, "expected to catch RESET_WAIT"
+
+    spi.set_pin(PAUSE, 1)
+    held = 0
+    while int(core.fsm_state.value) == RESET_WAIT:
+        await ClockCycles(dut.clk, 1)
+        held += 1
+        assert held < 4 * WAIT_LEN, "PAUSE froze RESET_WAIT"
+    spi.set_pin(PAUSE, 0)
+
+    assert int(core.fsm_state.value) == RESET, "did not proceed to RESET"
+    assert held <= WAIT_LEN, f"PAUSE stretched the grace period to {held}"
+
+
+@rtl_only
+async def test_rearm_starts_fresh_window(dut):
+    """Disarm mid-window, re-arm: the new window runs its full length.
+
+    The main counter is not cleared on disarm -- it is cleared by the arming
+    kick. If that clear were lost, the stale count would make the re-armed
+    window fire early. Needs WD_BASE_EXP >= 8 so the SPI disarm frame fits
+    inside the window.
+    """
+    window = 2**(WD_BASE_EXP + 1)     # timeout=1
+    spi = await setup(dut, "re-arm starts a fresh window")
+    core = dut.user_project
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=1))
+    await spi.pin_kick()
+    await ClockCycles(dut.clk, 150)
+    await spi.write(ADDR_CTRL, ctrl_word(en=0))   # disarm about half-way in
+    assert int(core.fsm_state.value) == IDLE, "disarm did not return to IDLE"
+
+    await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=1))
+    await spi.pin_kick()
+    held = 0
+    while not spi.get_out(IRQ):
+        await ClockCycles(dut.clk, 1)
+        held += 1
+        assert held < window + 200, "timeout never fired after re-arm"
+    assert held > window - 100, \
+        f"window only {held} clocks -- stale counter survived re-arm"

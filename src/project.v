@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Your Name
+ * Copyright (c) 2026 Jing Jer Yen
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -83,6 +83,9 @@ module tt_um_spi_watchdog #(
 
   localparam ADDR_CTRL = 2'd0, ADDR_KICK = 2'd1, ADDR_STATUS = 2'd2, ADDR_CTRL2 = 2'd3;
 
+  // Magic value a KICK write has
+  localparam KICK_MAGIC = 7'h5A;
+
   wire wr_ctrl   = wr_en & (wr_addr == ADDR_CTRL);
   wire wr_kick   = wr_en & (wr_addr == ADDR_KICK);
   wire wr_status = wr_en & (wr_addr == ADDR_STATUS);
@@ -112,7 +115,7 @@ module tt_um_spi_watchdog #(
   localparam IDLE       = 3'd0; // only in this state can user set CTRL, CTRL2
   localparam EARLY     = 3'd1; // counting, below early threshold, feed dog cause irq
   localparam NORMAL       = 3'd2; // counting, normal region, feed dog resets counter
-  localparam RESET_WAIT = 3'd3; // irq trigger, due to timeout from NORMAL or early feed from EARLY
+  localparam RESET_WAIT = 3'd3; // grace period before RESET; a W1C STATUS write escapes to IDLE
   localparam RESET      = 3'd4; // send reset pulse then back to IDLE
 
   // frequently used states
@@ -141,7 +144,7 @@ module tt_um_spi_watchdog #(
 
   // A kick is a rising edge on the KICK pin, or an SPI write of 0x5A
   // to address 1.
-  wire kick_evt = kick_pin_evt | (wr_kick & (wr_data == 7'h5A));
+  wire kick_evt = kick_pin_evt | (wr_kick & (wr_data == KICK_MAGIC));
 
   // Offset of the timeout bit above WD_BASE_EXP. Both window edges read it.
   reg [3:0] hi_off;
@@ -158,8 +161,8 @@ module tt_um_spi_watchdog #(
     endcase
   end
 
-  // WD_BASE_EXP is a parameter, so this index folds into a mux.
-  // this bit = 1 triggers timeout
+  // WD_BASE_EXP is a parameter, so this index folds into a mux instead of adder
+  // bit = 1 triggers timeout
   wire timeout_bit = counter[WD_BASE_EXP + hi_off];
 
   // suffix_or[i] = | counter[CNT_W-1:i]
@@ -168,7 +171,7 @@ module tt_um_spi_watchdog #(
   assign suffix_or[CNT_W-1] = counter[CNT_W-1];
   genvar i;
   generate
-    for (i = CNT_W - 2; i >= 0; i = i-1) begin: suffix_calc
+    for (i = 0; i < CNT_W - 1; i = i + 1) begin: suffix_calc
       assign suffix_or[i] = suffix_or[i+1] | counter[i];
     end
   endgenerate
@@ -198,7 +201,7 @@ module tt_um_spi_watchdog #(
   wire ps_tick;
 
   clk_div_pow2 #(
-      .SEL_N(8)                       // /1 .. /128
+      .SEL_N(8)
   ) u_prescaler (
       .clk  (clk),
       .rst_n(rst_n),
@@ -276,6 +279,8 @@ module tt_um_spi_watchdog #(
     end
   end
 
+  wire no_pending_flag = !early_flag & !irq_flag ;
+
   // state machine
   always @(posedge clk) begin
     if (!rst_n)
@@ -299,6 +304,7 @@ module tt_um_spi_watchdog #(
                           has_early ? EARLY : NORMAL;
 
       RESET_WAIT: nxt_state = !rst_en ? IDLE :
+                              no_pending_flag ? IDLE :
                               reset_counter[WD_BASE_EXP-2] ? RESET : RESET_WAIT;
 
       RESET: nxt_state = reset_counter[19] ? IDLE : RESET;
