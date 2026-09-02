@@ -97,6 +97,7 @@ module tt_um_spi_watchdog #(
   reg       en; // writes 0 : force state to IDLE. writes 1 + kick : starts counting
   reg       irq_en; // irq gating
   reg       rst_en; // wdt_rst gating
+  reg       lock; // if 1, en is no longer writable until rst_n=0
 
   reg [2:0] timeout_sel; // CTRL[4:2] TIMEOUT
   reg [1:0] window_sel; // CTRL[6:5] WINDOW
@@ -126,12 +127,12 @@ module tt_um_spi_watchdog #(
   // output pins
   wire irq  = irq_en & (irq_flag | early_flag);
   wire wdt_rst = ~(fsm_state == RESET);
-  assign uo_out = {5'b0, wdt_rst, irq, miso};
+  assign uo_out = {2'b0, fsm_state, wdt_rst, irq, miso};
 
   // read internal registers
   wire [6:0] ctrl_rd   = {window_sel, timeout_sel, irq_en, en};
   wire [6:0] status_rd = {4'b0, early_flag, counting, irq_flag};
-  wire [6:0] ctrl2_rd  = {3'b0, rst_en, prescaler};
+  wire [6:0] ctrl2_rd  = {2'b0, lock, rst_en, prescaler};
 
   always @(*) begin
     case (rd_addr)
@@ -182,7 +183,7 @@ module tt_um_spi_watchdog #(
 
   // en updates on the next clock. clr_en forwards a CTRL write that clears
   // EN, so en_now disarms the dog in the same clock
-  wire clr_en     = wr_ctrl & ~wr_data[0];
+  wire clr_en     = wr_ctrl & ~wr_data[0] & ~lock;
   wire en_now     = en & ~clr_en;
 
   wire valid_kick = kick_evt & en_now;
@@ -243,6 +244,7 @@ module tt_um_spi_watchdog #(
       en          <= 1'b0;
       irq_en      <= 1'b0;
       rst_en      <= 1'b0;
+      lock        <= 1'b0;
       timeout_sel <= 3'd0;
       window_sel  <= 2'd0;
       irq_flag    <= 1'b0;
@@ -250,7 +252,7 @@ module tt_um_spi_watchdog #(
       prescaler   <= 3'd0;
     end else begin
       // CTRL::en is always writable, while other fields are only writable in IDLE
-      if (wr_ctrl) begin
+      if (wr_ctrl && !lock) begin
         en <= wr_data[0];
         if (fsm_state == IDLE) begin
           irq_en      <= wr_data[1];
@@ -260,9 +262,10 @@ module tt_um_spi_watchdog #(
       end
 
       // CTRL2 follows the same rule as CTRL: only writable in IDLE
-      if (wr_ctrl2 && fsm_state == IDLE) begin
+      if (wr_ctrl2 && !lock && fsm_state == IDLE) begin
         prescaler <= wr_data[2:0];
         rst_en <= wr_data[3];
+        lock <= lock | (wr_data[4] & en);
       end
 
       // Both flags are sticky: a timeout or an early kick sets one, and a

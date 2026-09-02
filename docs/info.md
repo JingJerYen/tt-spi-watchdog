@@ -23,6 +23,10 @@ Main features:
   gets one last chance to cancel the reset (see "Second chance" below).
 - After a watchdog reset, the MCU can read back **why** it was reset: the
   fault flags survive the reset pulse.
+- A `LOCK` bit freezes the configuration, so software cannot switch the
+  watchdog off until the next hardware reset.
+- The FSM state is visible on three output pins, which makes silicon
+  bring-up easier.
 
 ![Block diagram](design.svg)
 
@@ -41,7 +45,8 @@ Main features:
 | `uo_out[0]`  | Out | `MISO` — SPI data out (this chip -> master)                     |
 | `uo_out[1]`  | Out | `IRQ` — fault interrupt, active high                            |
 | `uo_out[2]`  | Out | `WDT_RST_N` — reset output, active LOW. Idles high              |
-| `uo_out[7:3]`| Out | Unused, driven low                                              |
+| `uo_out[5:3]`| Out | `STATE` — current FSM state, for debug (encoding below)         |
+| `uo_out[7:6]`| Out | Unused, driven low                                              |
 | `uio[7:0]`   | —   | Unused                                                          |
 | `clk`        | In  | System clock. Timings below assume 50 MHz                       |
 | `rst_n`      | In  | Active low synchronous reset                                    |
@@ -140,12 +145,21 @@ after a watchdog reset the MCU can read why it was reset.
 | --- | ----------- | ----- | --------------------------------------------- |
 | 2:0 | `PRESCALER` | 000   | Window clock divider, /1 .. /128 (2^value)    |
 | 3   | `RST_EN`    | 0     | 1 = a fault leads to a `WDT_RST_N` pulse      |
-| 6:4 | —           | 000   | Unimplemented, reads as 0                     |
+| 4   | `LOCK`      | 0     | 1 = freeze `CTRL` and `CTRL2` until `rst_n`   |
+| 6:5 | —           | 00    | Unimplemented, reads as 0                     |
 
 `PRESCALER` divides the clock that feeds the window counter, so it scales
 every `TIMEOUT` setting by the same factor (up to 687 s at /128). It does
 NOT change the grace period or the reset pulse width. With `RST_EN` = 0 the
 watchdog is IRQ-only: a fault raises `IRQ` but never pulses `WDT_RST_N`.
+
+`LOCK` turns this into a watchdog that software cannot switch off. Once
+set, every write to `CTRL` and `CTRL2` is ignored — including `EN` = 0 —
+until the next `rst_n`. A fault still returns the FSM to `IDLE` with `EN`
+still 1, so the next `KICK` re-arms the dog. `LOCK` only takes effect while
+`EN` is already 1: a locked, disarmed watchdog could never be started
+again, so such a write is refused. The W1C second chance (below) still
+works while locked.
 
 ### Watchdog behavior
 
@@ -159,8 +173,13 @@ watchdog is IRQ-only: a fault raises `IRQ` but never pulses `WDT_RST_N`.
 | `RESET_WAIT` | Fault declared, grace period         | 2^16 clocks (1.31 ms)    |
 | `RESET`      | `WDT_RST_N` driven low               | 2^19 clocks (10.5 ms)    |
 
-Writing `EN` = 0 returns to `IDLE` at once from `EARLY` or `NORMAL`.
-`rst_n` returns to `IDLE` from any state, including `RESET`.
+Writing `EN` = 0 returns to `IDLE` at once from `EARLY` or `NORMAL`
+(ignored while `LOCK` is set). `rst_n` returns to `IDLE` from any state,
+including `RESET`.
+
+The current state is visible on `uo_out[5:3]` (`IDLE` = 0, `EARLY` = 1,
+`NORMAL` = 2, `RESET_WAIT` = 3, `RESET` = 4), so on real hardware a scope
+on these pins shows where the machine is without any SPI traffic.
 
 #### Kick
 
@@ -209,6 +228,11 @@ still 1, and the next `KICK` starts a fresh, full-length window.
 is running, a `CTRL` write updates `EN` alone, and a `CTRL2` write is
 discarded. To reconfigure: write `EN` = 0, write the new settings, write
 `EN` = 1, then `KICK`.
+
+With `LOCK` set, both registers are frozen entirely and reconfiguring is
+impossible until `rst_n`. The intended arming sequence for a locked
+watchdog is: write `CTRL` with the final settings and `EN` = 1, write
+`CTRL2` with the final settings and `LOCK` = 1, then `KICK`.
 
 #### `PAUSE`
 

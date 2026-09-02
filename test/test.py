@@ -80,9 +80,9 @@ def ctrl_word(en=0, irq_en=0, timeout=0, window=0):
             | ((window & 3) << 5))
 
 
-def ctrl2_word(prescaler=0):
-    """Pack a CTRL2 register value: {4'b0, PRESCALER[2:0]}."""
-    return prescaler & 7
+def ctrl2_word(prescaler=0, rst_en=0, lock=0):
+    """Pack a CTRL2 register value: {3'b0, LOCK, RST_EN, PRESCALER[2:0]}."""
+    return (prescaler & 7) | ((rst_en & 1) << 3) | ((lock & 1) << 4)
 
 
 class SpiMaster:
@@ -588,12 +588,13 @@ async def test_irq_en_release_keeps_flag(dut):
 
 @cocotb.test()
 async def test_unused_pins(dut):
-    """I1 + I3: uo_out[7:3] stay low, wdt_rst idles high, ui_in[7:5] do nothing.
+    """I1 + I3: output packing (spares, state pins, wdt_rst), inputs inert.
 
     I1 guards the output packing in project.v -- a mis-sized concatenation
-    would light up a spare pin. uo_out[2] is the active-low wdt_rst, so its
-    idle level is 1, not 0. I3 guards the input pin map: driving the
-    unused inputs high must change nothing, which a typo'd index would break.
+    would light up a spare pin. uo_out[7:6] are the only true spares now:
+    uo_out[5:3] expose fsm_state for bring-up, and uo_out[2] is the
+    active-low wdt_rst, idling at 1. I3 guards the input pin map: driving
+    the unused inputs high must change nothing.
 
     This one runs at gate level too, deliberately: pin mapping and output
     packing are exactly what place-and-route could disturb, and the checks
@@ -602,12 +603,14 @@ async def test_unused_pins(dut):
     """
     spi = await setup(dut, "I1/I3 unused pins")
 
-    def check_spare_outputs(where):
-        spare = int(dut.uo_out.value) >> 3
-        assert spare == 0, f"uo_out[7:3] = {spare:#04x} at {where}"
+    def check_output_pins(where, state):
+        out = int(dut.uo_out.value)
+        assert out >> 6 == 0, f"uo_out[7:6] = {out >> 6} at {where}"
+        assert (out >> 3) & 7 == state, \
+            f"state pins uo_out[5:3] = {(out >> 3) & 7}, want {state} at {where}"
         assert spi.get_out(WDT_RST) == 1, f"wdt_rst not idle-high at {where}"
 
-    check_spare_outputs("reset")
+    check_output_pins("reset", IDLE)
 
     # Drive the unused inputs high for the rest of the test.
     for bit in (5, 6, 7):
@@ -617,20 +620,21 @@ async def test_unused_pins(dut):
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
     assert await spi.read(ADDR_CTRL) == ctrl_word(en=1, irq_en=1, timeout=0), \
         "CTRL readback changed by the unused inputs"
-    check_spare_outputs("after CTRL write")
+    check_output_pins("after CTRL write", IDLE)
 
     await spi.kick()
     assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "kick did not arm"
-    check_spare_outputs("armed")
+    check_output_pins("armed", NORMAL)     # window off: arms into NORMAL
 
 
 @rtl_only
 async def test_unused_pins_under_irq(dut):
-    """I1: uo_out[7:3] stay low even while IRQ is asserted.
+    """I1: spares stay low and state pins read IDLE while IRQ is asserted.
 
-    Split from test_unused_pins because it needs a real timeout. Sampling the
-    spare bits with IRQ high proves they are not simply a bus that happens to
-    sit at zero.
+    Split from test_unused_pins because it needs a real timeout. Sampling
+    with IRQ high proves the spare bits are not simply a bus that happens to
+    sit at zero. After a timeout with RST_EN clear the FSM is back in IDLE,
+    so the state pins must read 0 even with the flag set.
     """
     spi = await setup(dut, "I1 unused outputs under IRQ")
 
@@ -642,8 +646,10 @@ async def test_unused_pins_under_irq(dut):
     await wait_for_irq(spi)
     assert (await spi.read(ADDR_STATUS)) & ST_IRQ_FLAG, "timeout did not fire"
 
-    spare = int(dut.uo_out.value) >> 3
-    assert spare == 0, f"uo_out[7:3] = {spare:#04x} while IRQ asserted"
+    out = int(dut.uo_out.value)
+    assert out >> 6 == 0, f"uo_out[7:6] = {out >> 6} while IRQ asserted"
+    assert (out >> 3) & 7 == IDLE, \
+        f"state pins = {(out >> 3) & 7} while IRQ asserted, want IDLE"
     assert spi.get_out(WDT_RST) == 1, "wdt_rst asserted (low) by an IRQ"
 
 
@@ -1152,8 +1158,7 @@ async def arm_for_reset(dut, rst_en=1, timeout=0, prescaler=0, irq_en=1):
     CTRL2 carries RST_EN and is writable only in IDLE, so it goes first.
     """
     spi = await setup(dut, f"reset output, RST_EN={rst_en}")
-    await spi.write(ADDR_CTRL2,
-                    ctrl2_word(prescaler) | (RST_EN if rst_en else 0))
+    await spi.write(ADDR_CTRL2, ctrl2_word(prescaler, rst_en=rst_en))
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=irq_en, timeout=timeout))
     await spi.kick()
     return spi
@@ -1293,7 +1298,7 @@ async def test_early_kick_drives_reset(dut):
     # WIN_SEL is wide enough that an SPI frame fits inside the closed half.
     # A pin kick is used for the same reason arm() does: it is ~12 clocks
     # against a frame's ~130.
-    await spi.write(ADDR_CTRL2, ctrl2_word(0) | RST_EN)
+    await spi.write(ADDR_CTRL2, ctrl2_word(0, rst_en=1))
     await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=WIN_SEL,
                                          window=1))
     await spi.pin_kick()                      # arms, opens the closed half
@@ -1433,7 +1438,7 @@ async def test_reset_wait_fixed_length(dut):
     """The grace period is WAIT_LEN clocks for every prescaler setting."""
     for ps in range(4):
         spi = await setup(dut, f"RESET_WAIT length, prescaler={ps}")
-        await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=ps) | RST_EN)
+        await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=ps, rst_en=1))
         await spi.write(ADDR_CTRL, ctrl_word(en=1, irq_en=1, timeout=0))
         await spi.kick()
         await run_to_fault(dut, prescaler=ps)
@@ -1570,3 +1575,56 @@ async def test_rearm_starts_fresh_window(dut):
         assert held < window + 200, "timeout never fired after re-arm"
     assert held > window - 100, \
         f"window only {held} clocks -- stale counter survived re-arm"
+
+
+@cocotb.test()
+async def test_lock_bit(dut):
+    """LOCK freezes CTRL and CTRL2 until rst_n, and cannot lock a disarmed dog.
+
+    Phases: (1) LOCK written while EN=0 does not take, (2) LOCK with EN=1
+    takes and freezes both registers, (3) a locked, armed dog ignores an
+    EN=0 write completely -- the window must keep running, which guards the
+    clr_en forwarding path as well as the register, (4) rst_n clears LOCK.
+    """
+    spi = await setup(dut, "LOCK bit")
+
+    # (1) LOCK while EN=0 must not take (a locked disarmed dog would be
+    # bricked until rst_n, so the RTL refuses it).
+    await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=2, rst_en=1, lock=1))
+    assert await spi.read(ADDR_CTRL2) == ctrl2_word(prescaler=2, rst_en=1), \
+        "LOCK took effect with EN=0"
+
+    # Registers are still writable.
+    ctrl_armed = ctrl_word(en=1, irq_en=1, timeout=SEL_MAX)
+    ctrl2_locked = ctrl2_word(prescaler=1, rst_en=0, lock=1)
+    await spi.write(ADDR_CTRL, ctrl_armed)
+    assert await spi.read(ADDR_CTRL) == ctrl_armed
+
+    # (2) EN=1, so this LOCK takes; prescaler/rst_en land in the same write.
+    await spi.write(ADDR_CTRL2, ctrl2_locked)
+    assert await spi.read(ADDR_CTRL2) == ctrl2_locked, "LOCK did not take"
+
+    # Both registers are now frozen.
+    await spi.write(ADDR_CTRL, ctrl_word(en=0))
+    await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=7, rst_en=1, lock=0))
+    assert await spi.read(ADDR_CTRL) == ctrl_armed, "CTRL written while locked"
+    assert await spi.read(ADDR_CTRL2) == ctrl2_locked, "CTRL2 written while locked"
+
+    # (3) Arm and try to disarm through the locked register. The window must
+    # keep running: not just the EN bit, but also the same-clock clr_en
+    # forwarding into the FSM must be gated by LOCK.
+    await spi.kick()
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, "kick did not arm"
+    await spi.write(ADDR_CTRL, ctrl_word(en=0))
+    assert (await spi.read(ADDR_STATUS)) & ST_ARMED, \
+        "EN=0 write stopped a locked watchdog"
+
+    # (4) Only rst_n releases the lock.
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 5)
+    assert await spi.read(ADDR_CTRL2) == 0, "CTRL2 not cleared by rst_n"
+    await spi.write(ADDR_CTRL2, ctrl2_word(prescaler=3))
+    assert await spi.read(ADDR_CTRL2) == ctrl2_word(prescaler=3), \
+        "CTRL2 still locked after rst_n"
