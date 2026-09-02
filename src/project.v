@@ -221,12 +221,17 @@ module tt_um_spi_watchdog #(
     else if (inc_cnt) counter <= counter + 1'b1;
   end
 
-  // in RESET state, reset_counter holds wdt_rst low for 2^19 ps_ticks
+  // in RESET_WAIT, reset_counter counts up to 2^(WD_BASE-2) ticks
+  // in RESET, reset_counter holds wdt_rst low for 2^19 ps_ticks
+  wire wait_or_reset = (fsm_state == RESET_WAIT) | (fsm_state == RESET);
+
   always @(posedge clk) begin
     if (!rst_n)
       reset_counter <= 20'b0;
+    else if (!wait_or_reset || (fsm_state != nxt_state))
+      reset_counter <= 20'b0;
     else
-      reset_counter <= (fsm_state == RESET) ? (reset_counter + 1) : 0;
+      reset_counter <= reset_counter + 1;
   end
 
   // writes to CTRL, CTRL2
@@ -294,7 +299,7 @@ module tt_um_spi_watchdog #(
                           has_early ? EARLY : NORMAL;
 
       RESET_WAIT: nxt_state = !rst_en ? IDLE :
-                              ps_tick ? RESET : RESET_WAIT;
+                              reset_counter[WD_BASE_EXP-2] ? RESET : RESET_WAIT;
 
       RESET: nxt_state = reset_counter[19] ? IDLE : RESET;
       default: nxt_state = IDLE;
