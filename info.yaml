@@ -38,9 +38,9 @@ pinout:
   uo[0]: "MISO" # SPI data out (this chip -> master)
   uo[1]: "IRQ" # Watchdog timeout interrupt
   uo[2]: "WDT_RST_N" # Watchdog reset pulse (active low)
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
+  uo[3]: "STATE[0]" # debug, internal fsm state
+  uo[4]: "STATE[1]" # debug, internal fsm state
+  uo[5]: "STATE[2]" # debug, internal fsm state
   uo[6]: ""
   uo[7]: ""
 
