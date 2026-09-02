@@ -5,7 +5,7 @@
 
 `default_nettype none
 
-module tt_um_spi_watchdog #(
+module tt_um_jjy_spi_watchdog #(
     // Timeout base exponent. The eight settings span 2^18 .. 2^28 clocks.
     // Testbenches lower it to shorten simulation.
     // Minimum is 3: the early-window index reaches WD_BASE_EXP - 3.

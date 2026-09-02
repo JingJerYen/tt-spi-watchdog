@@ -42,9 +42,9 @@ module tb ();
   parameter WD_BASE_EXP = 8;
 
 `ifdef GL_TEST
-  tt_um_spi_watchdog user_project (
+  tt_um_jjy_spi_watchdog user_project (
 `else
-  tt_um_spi_watchdog #(
+  tt_um_jjy_spi_watchdog #(
       .WD_BASE_EXP(WD_BASE_EXP)
   ) user_project (
 `endif

@@ -1,6 +1,6 @@
 # Verification Plan
 
-A feature-by-feature verification plan for `tt_um_spi_watchdog`, derived from
+A feature-by-feature verification plan for `tt_um_jjy_spi_watchdog`, derived from
 [docs/info.md](info.md) and the RTL in [src/](../src/).
 
 ## How to read this
