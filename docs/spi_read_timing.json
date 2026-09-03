@@ -1,0 +1,90 @@
+{
+  "signal": [
+    {
+      "name": "CS_N",
+      "wave": "10.........1."
+    },
+    {
+      "name": "SCLK",
+      "wave": "lnnnnnnnnnnl."
+    },
+    {
+      "name": "MOSI",
+      "wave": "x344x........",
+      "data": [
+        "R/W=1",
+        "A1",
+        "A0"
+      ]
+    },
+    {
+      "name": "MISO",
+      "wave": "0...77777770.",
+      "data": [
+        "D6",
+        "D5",
+        "D4",
+        "D3",
+        "D2",
+        "D1",
+        "D0"
+      ]
+    },
+    {},
+    {
+      "name": "cnt",
+      "wave": "============.",
+      "data": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "0"
+      ],
+      "phase": -1
+    },
+    {
+      "name": "is_read",
+      "wave": "01...........",
+      "phase": -1
+    },
+    {
+      "name": "rd_addr",
+      "wave": "x.=4.........",
+      "data": [
+        "{?,A1}",
+        "A[1:0]"
+      ],
+      "phase": -1
+    },
+    {
+      "name": "rd_data",
+      "wave": "x.=7.........",
+      "data": [
+        "reg[?]",
+        "reg[A]"
+      ],
+      "phase": -1
+    },
+    {
+      "name": "wr_en",
+      "wave": "0............"
+    }
+  ],
+  "head": {
+    "text": "Read frame: rd_addr shifts in A1 on rising edge 2 and A0 on rising edge 3, MISO is updated on falling edges 3..9"
+  },
+  "foot": {
+    "text": "MISO gets rd_data[6] on the falling edge where cnt == 3 (AW+1), down to rd_data[0] where cnt == 9 (FRAME_BITS-1)."
+  },
+  "config": {
+    "hscale": 2
+  }
+}

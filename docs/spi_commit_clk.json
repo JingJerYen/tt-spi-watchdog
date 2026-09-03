@@ -1,0 +1,53 @@
+{
+  "signal": [
+    {
+      "name": "clk",
+      "wave": "p........"
+    },
+    {
+      "name": "CS_N (pin)",
+      "wave": "0.1......"
+    },
+    {
+      "name": "cs_n_s0",
+      "wave": "0..1....."
+    },
+    {
+      "name": "cs_n_s1",
+      "wave": "0...1...."
+    },
+    {
+      "name": "cs_n_active",
+      "wave": "1...0...."
+    },
+    {},
+    {
+      "name": "cnt",
+      "wave": "=....=...",
+      "data": [
+        "10",
+        "0"
+      ]
+    },
+    {
+      "name": "wr_en",
+      "wave": "0...10..."
+    },
+    {
+      "name": "wr_addr / wr_data",
+      "wave": "4........",
+      "data": [
+        "rx fields, valid"
+      ]
+    }
+  ],
+  "head": {
+    "text": "Frame commit at clk scale: wr_en = ~cs_n_active & (cnt == 10)"
+  },
+  "foot": {
+    "text": "cs_n_s1 rises one clk before it clears cnt, so exactly one clk sees CS_N inactive with cnt still 10: the write strobe."
+  },
+  "config": {
+    "hscale": 2
+  }
+}

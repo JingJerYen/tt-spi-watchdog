@@ -1,0 +1,85 @@
+{
+  "signal": [
+    {
+      "name": "clk",
+      "wave": "p..........."
+    },
+    {
+      "name": "SCLK (pin)",
+      "wave": "0.1.0......."
+    },
+    {
+      "name": "sclk_s0",
+      "wave": "0..1.0......"
+    },
+    {
+      "name": "sclk_s1",
+      "wave": "0...1.0....."
+    },
+    {
+      "name": "sclk_s2",
+      "wave": "0....1.0...."
+    },
+    {
+      "name": "sample",
+      "wave": "0...10......"
+    },
+    {
+      "name": "down",
+      "wave": "0.....10...."
+    },
+    {},
+    {
+      "name": "cnt",
+      "wave": "=....=......",
+      "data": [
+        "2",
+        "3"
+      ]
+    },
+    {
+      "name": "MOSI (pin)",
+      "wave": "4...x.......",
+      "data": [
+        "A0"
+      ]
+    },
+    {
+      "name": "mosi_s1",
+      "wave": "4.....x.....",
+      "data": [
+        "A0"
+      ]
+    },
+    {
+      "name": "rd_addr",
+      "wave": "x....4......",
+      "data": [
+        "A[1:0]"
+      ]
+    },
+    {
+      "name": "rd_data",
+      "wave": "x....7......",
+      "data": [
+        "reg[A]"
+      ]
+    },
+    {
+      "name": "MISO",
+      "wave": "0......7....",
+      "data": [
+        "D6"
+      ]
+    }
+  ],
+  "head": {
+    "text": "Loading the first data bit at clk scale, SCLK high for the minimum 2 clk"
+  },
+  "foot": {
+    "text": "sample (rising edge 3) latches A0 into rd_addr and bumps cnt. down (falling edge 3) comes 2 clk later, so rd_data has 1 clk of margin."
+  },
+  "config": {
+    "hscale": 2
+  }
+}

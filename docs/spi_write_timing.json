@@ -1,0 +1,79 @@
+{
+  "signal": [
+    {
+      "name": "CS_N",
+      "wave": "10.........1."
+    },
+    {
+      "name": "SCLK",
+      "wave": "lnnnnnnnnnnl."
+    },
+    {
+      "name": "MOSI",
+      "wave": "x3447777777x.",
+      "data": [
+        "R/W=0",
+        "A1",
+        "A0",
+        "D6",
+        "D5",
+        "D4",
+        "D3",
+        "D2",
+        "D1",
+        "D0"
+      ]
+    },
+    {
+      "name": "MISO",
+      "wave": "0............"
+    },
+    {},
+    {
+      "name": "cnt",
+      "wave": "============.",
+      "data": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "0"
+      ],
+      "phase": -1
+    },
+    {
+      "name": "wr_en",
+      "wave": "0..........10"
+    },
+    {
+      "name": "wr_addr",
+      "wave": "x..........4x",
+      "data": [
+        "A[1:0]"
+      ]
+    },
+    {
+      "name": "wr_data",
+      "wave": "x..........7x",
+      "data": [
+        "D[6:0]"
+      ]
+    }
+  ],
+  "head": {
+    "text": "Write frame: MOSI is sampled on every SCLK rising edge, cnt counts the rising edges seen"
+  },
+  "foot": {
+    "text": "wr_en is one clk wide, a few clk after CS_N rises (not to scale), and only if cnt == 10 then. MISO stays 0 all frame."
+  },
+  "config": {
+    "hscale": 2
+  }
+}
