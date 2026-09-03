@@ -22,6 +22,9 @@
 // limit: each sclk level must last at least two clk periods to be stable, so
 // sclk must last 4 times of clk.
 //
+// Waveforms for both frame types and for the clk-level detail of the write
+// strobe and the first MISO bit are in docs/spi_timing.md.
+//
 // The register file itself lives outside this module:
 //   - a write appears as wr_en for one clk, with wr_addr / wr_data valid
 //   - rd_addr is driven as soon as the address arrives, and rd_data must be
@@ -85,7 +88,7 @@ module spi_regs #(
   wire down = cs_n_active & (sclk_s2 & ~sclk_s1); // 1-->0
 
   reg [CNT_W-1:0] cnt;
-  reg [FRAME_BITS-1:0] rx;
+  reg [AW+DW-1:0] rx; // only addr and data, rw is stored in is_read
 
   // shift mosi to rx, MSB first
   always @(posedge clk) begin
@@ -96,7 +99,7 @@ module spi_regs #(
       cnt <= 0;
     end else if (sample && (cnt <= FRAME_BITS)) begin
       cnt <= cnt + 1;
-      rx <= {rx[FRAME_BITS-2:0], mosi_s1};
+      rx <= {rx[AW+DW-2:0], mosi_s1};
     end
   end
 
