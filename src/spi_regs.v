@@ -13,17 +13,14 @@
 //   [ R/W ][ ADDR (AW bits) ][ DATA (DW bits) ]
 //
 // R/W is 1 for a read. A read returns rd_data in the DATA positions; miso is
-// 0 during the R/W and ADDR bits. A frame is acted on only if exactly
+// 0 during the R/W and ADDR bits. A write frame is acted on only if exactly
 // 1 + AW + DW bits were clocked in before cs_n rose, so partial or overlong
 // transfers are discarded rather than half applied.
 //
-// sclk, mosi and cs_n are treated as asynchronous and synchronised here, so
-// they may be wired straight to package pins.
-//
 // sclk is sampled rather than used as a clock, so the whole module sits in
 // the clk domain and nothing here is timed against sclk. The price is a rate
-// limit: each sclk level must last at least two clk periods to be seen, so
-// sclk must stay below roughly clk/4.
+// limit: each sclk level must last at least two clk periods to be stable, so
+// sclk must last 4 times of clk.
 //
 // The register file itself lives outside this module:
 //   - a write appears as wr_en for one clk, with wr_addr / wr_data valid
@@ -41,7 +38,7 @@ module spi_regs #(
     input  wire          sclk,
     input  wire          mosi,
     input  wire          cs_n,
-    output wire          miso,
+    output reg           miso,
 
     // Register write port, valid while wr_en is high
     output wire          wr_en,
@@ -54,16 +51,13 @@ module spi_regs #(
 );
 
   localparam FRAME_BITS = 1 + AW + DW;
-  localparam CNT_W      = $clog2(FRAME_BITS + 2);
-  // One past the frame length, used as a saturating "too long" marker.
-  localparam CNT_MAX    = FRAME_BITS + 1;
+  localparam CNT_W      = $clog2(FRAME_BITS+2); // a slack for overcounts
 
-  // --- Input synchronisers -------------------------------------------------
-  // Three stages so both edges of sclk can be recovered by comparing the
-  // last two, and so cs_n's edge is seen by the same stage that qualifies
-  // sampling (mismatching them races the final shift).
+  // --- Clock Domain Crossing ---
+  // Classic 2 stage Flip-Flop synchronizer, with the 3rd Flip-Flop for edge
+  // detection for sclk and cs_n. Mosi doesn't require edge detection.
   reg sclk_s0, sclk_s1, sclk_s2;
-  reg cs_n_s0, cs_n_s1, cs_n_s2;
+  reg cs_n_s0, cs_n_s1;
   reg mosi_s0, mosi_s1;
 
   always @(posedge clk) begin
@@ -73,7 +67,6 @@ module spi_regs #(
       sclk_s2 <= 1'b0;
       cs_n_s0 <= 1'b1;
       cs_n_s1 <= 1'b1;
-      cs_n_s2 <= 1'b1;
       mosi_s0 <= 1'b0;
       mosi_s1 <= 1'b0;
     end else begin
@@ -82,81 +75,62 @@ module spi_regs #(
       sclk_s2 <= sclk_s1;
       cs_n_s0 <= cs_n;
       cs_n_s1 <= cs_n_s0;
-      cs_n_s2 <= cs_n_s1;
       mosi_s0 <= mosi;
       mosi_s1 <= mosi_s0;
     end
   end
 
-  wire cs_active = ~cs_n_s1;
-  wire cs_n_rise = cs_n_s1 & ~cs_n_s2;         // end of frame
-  wire sample    = (sclk_s1 & ~sclk_s2) & cs_active;  // rising: latch mosi
-  wire shift_out = (~sclk_s1 & sclk_s2) & cs_active;  // falling: update miso
+  wire cs_n_active = ~cs_n_s1;
+  wire sample = cs_n_active & (~sclk_s2 & sclk_s1); // 0-->1
+  wire down = cs_n_active & (sclk_s2 & ~sclk_s1); // 1-->0
 
-  // --- Receive shift register ----------------------------------------------
+  reg [CNT_W-1:0] cnt;
   reg [FRAME_BITS-1:0] rx;
-  reg [CNT_W-1:0]      cnt;
 
+  // shift mosi to rx, MSB first
   always @(posedge clk) begin
     if (!rst_n) begin
-      rx  <= {FRAME_BITS{1'b0}};
-      cnt <= {CNT_W{1'b0}};
-    end else if (cs_n_rise) begin
-      cnt <= {CNT_W{1'b0}};                    // frame consumed, re-arm
-    end else if (sample) begin
+      cnt <= 0;
+      rx <= 0;
+    end else if (!cs_n_active) begin
+      cnt <= 0;
+    end else if (sample && (cnt <= FRAME_BITS)) begin
+      cnt <= cnt + 1;
       rx <= {rx[FRAME_BITS-2:0], mosi_s1};
-      if (cnt != CNT_MAX[CNT_W-1:0]) cnt <= cnt + 1'b1;  // saturate
     end
   end
 
-  // These slices are only meaningful once every field has shifted into its
-  // final position, which is exactly when a write commits.
-  wire frame_ok = cs_n_rise & (cnt == FRAME_BITS[CNT_W-1:0]);
+  // only update when R/W bit comes
+  reg is_read;
+  always @(posedge clk) begin
+    if (!rst_n)
+      is_read <= 0;
+    else if (sample && (cnt == 0))
+      is_read <= mosi_s1;
+  end
 
-  assign wr_en   = frame_ok & ~rx[FRAME_BITS-1];   // R/W low = write
-  assign wr_addr = rx[FRAME_BITS-2 -: AW];
+  // according to cnt, pick the index to miso
+  always @(posedge clk) begin
+    if (!rst_n)
+      miso <= 0;
+    else if (!is_read || !cs_n_active)
+      miso <= 0;
+    else if (down && (cnt > AW) && (cnt < FRAME_BITS))
+      miso <= rd_data[DW-1-(cnt-AW-1)];
+  end
+
+  // after all mosi data collected, raise wr_en
+  assign wr_en = ~cs_n_active & ~is_read & (cnt == FRAME_BITS);
+  assign wr_addr = rx[DW+AW-1:DW];
   assign wr_data = rx[DW-1:0];
 
-  // --- Read address capture ------------------------------------------------
-  // Reads cannot wait for the frame to finish: SPI is full duplex, so the
-  // master is clocking miso in while it is still clocking ADDR out. The
-  // value has to be loaded before the DATA bits go past, at which point the
-  // slices above still hold whatever is passing through. So each field is
-  // captured off mosi the cycle it arrives, before shifting carries it away.
-  reg rd_req;
-
+  // when cnt = 1~AW , shift out the mosi to rd_addr
   always @(posedge clk) begin
-    if (!rst_n) begin
-      rd_req  <= 1'b0;
-      rd_addr <= {AW{1'b0}};
-    end else if (sample) begin
-      if (cnt == {CNT_W{1'b0}})
-        rd_req <= mosi_s1;                        // first bit is R/W
-      else if (cnt <= AW[CNT_W-1:0])
-        rd_addr <= {rd_addr[AW-2:0], mosi_s1};    // next AW bits are the address
-    end
+    if (!rst_n)
+      rd_addr <= 0;
+    else if (sample && (cnt >= 1) && (cnt <= AW))
+      rd_addr <= {rd_addr[AW-2:0], mosi_s1};
   end
-
-  // --- Transmit shift register ---------------------------------------------
-  // Loaded once R/W and ADDR are in, so it lines up with the DATA positions.
-  // Before that it shifts zeros out, which is what the master sees during
-  // the R/W and ADDR bits.
-  reg [DW-1:0] tx;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      tx <= {DW{1'b0}};
-    end else if (~cs_active) begin
-      tx <= {DW{1'b0}};
-    end else if (shift_out) begin
-      if (cnt == (AW[CNT_W-1:0] + 1'b1))
-        tx <= rd_req ? rd_data : {DW{1'b0}};
-      else
-        tx <= {tx[DW-2:0], 1'b0};
-    end
-  end
-
-  assign miso = tx[DW-1];
 
 endmodule
 
