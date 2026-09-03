@@ -58,6 +58,7 @@ make -f Makefile.cov cov-report   # annotate and list uncovered points
 | A7 | SCLK edges while CS_N is high are ignored | [spi_regs.v:86](../src/spi_regs.v#L86) | [test_spi.py](../test/test_spi.py) `test_a7_sclk_ignored_while_cs_high` | PASS |
 | A8 | SCLK / CS_N are asynchronous and synchronised before use | [spi_regs.v:65-84](../src/spi_regs.v#L65-L84) | not simulatable — see J1 | WAIVE |
 | A9 | R/W selects write (0) or read (1) | [spi_regs.v:111](../src/spi_regs.v#L111) | folded into A3 | PASS |
+| A10 | rd_addr carries exactly the ADDR field, valid before the DATA bits shift out | [spi_regs.v:123-128](../src/spi_regs.v#L123-L128) | [test_spi.py](../test/test_spi.py) `test_a10_rd_addr_follows_addr_field` | PASS |
 
 ### A4 and A5 — one length sweep
 
@@ -547,6 +548,7 @@ specific way the row describes, confirm the test fails, restore.
 | --- | --- | --- |
 | A4/A5 | Remove the saturating guard on `cnt` | yes |
 | A6/A9 | `tx <= rd_data`, ignoring `rd_req` | yes |
+| A10 | Capture rd_addr on `cnt < AW` (R/W bit and A1 instead of the ADDR field) | yes |
 | B6 | Let a STATUS write set `armed` | yes |
 | C6 | `irq_flag` survives reset | yes |
 | G5 | `irq = irq_flag`, ignoring `irq_en` | yes |

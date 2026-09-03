@@ -29,7 +29,7 @@ import os
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
 
 CLK_NS = 20  # 50 MHz, matching the datasheet
 
@@ -147,6 +147,40 @@ class WriteMonitor:
         self.writes = []
 
 
+def addr_pattern(addr):
+    """A distinct, asymmetric DATA value for each address.
+
+    Injective over the address space, so any misread address -- shifted,
+    duplicated bit, off by one -- returns a value that belongs to no address
+    at all, or to the wrong one. Either way the compare fails.
+    """
+    return (0x4B + addr * 0x11) & DATA_MASK
+
+
+class ReadMirror:
+    """Drive rd_data as a function of rd_addr, standing in for a register file.
+
+    tb_spi.v ties rd_data to a plain register the test sets, so on its own a
+    read returns whatever was last driven regardless of the address spi_regs
+    decoded. That leaves rd_addr entirely unchecked. This mirror closes the
+    gap: with rd_data = addr_pattern(rd_addr), the DATA field that comes back
+    over MISO is only right if rd_addr was.
+
+    The update runs on the falling edge of clk, so rd_data settles well before
+    the next rising edge -- a slightly slow combinational read port, which is
+    still within what spi_regs's rate limit allows.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        cocotb.start_soon(self._run())
+
+    async def _run(self):
+        while True:
+            await FallingEdge(self.dut.clk)
+            self.dut.rd_data.value = addr_pattern(int(self.dut.rd_addr.value))
+
+
 async def setup(dut, log="Start"):
     dut._log.info(f"{log}  (AW={AW} DW={DW} FRAME_BITS={FRAME_BITS})")
     cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
@@ -177,8 +211,8 @@ async def test_a1_mosi_sampled_on_rising_edge(dut):
     mon = WriteMonitor(dut)
 
     # a random addr + data with explicit `write` bit (MSB = 0)
-    want = 0b0010101101 & ~((1 << FRAME_BITS) - 1)
-    disturb = ~want & ~((1 << FRAME_BITS) - 1)
+    want = 0b0010101101 & ((1 << FRAME_BITS) - 1)
+    disturb = ~want & ((1 << FRAME_BITS) - 1)
 
     # pull down CS_N to start
     spi.dut.cs_n.value = 0
@@ -392,3 +426,36 @@ async def test_a7_sclk_ignored_while_cs_high(dut):
         rd = await spi.read(addr)
         assert rd == value, f"A7: read frame layout incorrect: {rd:#04x} != {value:#04x}"
     assert len(mon.writes) == 0, f"A7: read frame caused a write: {mon.writes}"
+
+
+@cocotb.test()
+async def test_a10_rd_addr_follows_addr_field(dut):
+    """A10: rd_addr carries exactly the ADDR field of a read frame.
+
+    The other read tests drive rd_data with a constant, so they pass even if
+    rd_addr is garbage. Here a ReadMirror makes rd_data depend on rd_addr,
+    and every address is read back in turn. The returned DATA field then
+    equals addr_pattern(addr) only if spi_regs decoded the address correctly
+    and had it on rd_addr before the DATA bits started shifting out.
+
+    The second assert checks the port directly: rd_addr is only ever loaded
+    from the ADDR bits, so after the frame it must still hold that address.
+    """
+    spi = await setup(dut, "A10 rd_addr follows ADDR field")
+    mon = WriteMonitor(dut)
+    ReadMirror(dut)
+
+    # Descending as well as ascending, so a stale rd_addr from the previous
+    # frame cannot happen to equal the one expected now.
+    order = list(range(1 << AW)) + list(range((1 << AW) - 1, -1, -1))
+    for addr in order:
+        rd = await spi.read(addr)
+        want = addr_pattern(addr)
+        assert rd == want, (
+            f"A10: read of addr {addr:#04x} returned {rd:#04x}, "
+            f"expected {want:#04x} (rd_addr={int(dut.rd_addr.value):#04x})"
+        )
+        assert int(dut.rd_addr.value) == addr, (
+            f"A10: rd_addr={int(dut.rd_addr.value):#04x} after reading {addr:#04x}"
+        )
+    assert len(mon.writes) == 0, f"A10: read frames caused writes: {mon.writes}"
