@@ -21,6 +21,7 @@ is why this example shrinks `WD_BASE_EXP` from 18 to 3.
 - `wdt.sby` the SymbiYosys config: which files to read, how deep to run, which
   solver to use.
 - `Makefile` the entry point for everything below.
+- `mkgtkw.py` writes a GTKWave save file for a trace, since sby does not.
 
 ## Three keywords
 
@@ -53,7 +54,7 @@ make
 | `make proof` | k-induction, proves the asserts hold forever |
 | `make irq_demo` | deliberately failing example, shows a counterexample |
 | `make all` | all four (`irq_demo` is expected to FAIL) |
-| `make wave` | open the most recent waveform in gtkwave |
+| `make wave` | open the most recent waveform, signals already placed |
 | `make clean` | remove every directory sby produced |
 
 - `bmc` checks every assert. A final `PASS` means that within the configured
@@ -64,17 +65,39 @@ make
   solver answers with an SPI frame that proves otherwise, in
   `wdt_irq_demo/engine_0/trace.vcd`.
 
-`make wave` picks the most recently produced waveform:
+## Opening a waveform
+
+sby writes a `.vcd` but no `.gtkw`, so GTKWave opens on an empty pane and the
+signal you actually want is somewhere in a tree of a hundred names. There is
+no upstream option for this: neither sby nor yosys emits a save file.
+
+`mkgtkw.py` uses the fact that sby names the exact source span of whatever it
+reported:
+
+```
+Assert failed in wdt_formal: wdt_formal.sv:121.7-121.21 (_witness_.check_419)
+```
+
+It reads that span out of the source, keeps the identifiers that exist in the
+trace, and writes a save file with those and nothing else. For
+`assert (!irq)` that is one signal.
 
 ```bash
 make wave
 ```
 
-For a specific one, call gtkwave directly:
+That picks the most recent trace, generates its `.gtkw` and opens both. For a
+particular trace, name it directly:
 
 ```bash
-gtkwave wdt_irq_demo/engine_0/trace.vcd
+./mkgtkw.py wdt_cover/engine_0/trace5.vcd
+gtkwave wdt_cover/engine_0/trace5.vcd wdt_cover/engine_0/trace5.gtkw
 ```
+
+A cover run writes one trace per cover statement, so the sby log is walked in
+order to pair each trace with the cover that produced it. Note that the span
+sby reports covers the property itself, not any enclosing `if`: a failure of
+P4 lists `state`, not the `quiet` that guarded it.
 
 ## Reading the result
 

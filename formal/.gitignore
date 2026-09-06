@@ -3,3 +3,6 @@ wdt_cover/
 wdt_irq_demo/
 wdt/
 wdt_proof/
+*.gtkw
+!sbyproof.gtkw
+__pycache__/
