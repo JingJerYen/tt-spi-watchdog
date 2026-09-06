@@ -39,6 +39,11 @@ Numbers from the sky130A OpenLane 2 signoff run.
 The cocotb testbench lives in [test/](test/); see
 [test/README.md](test/README.md) for how to run it at RTL and gate level.
 
+A testbench only covers the cases you thought of, so the properties that matter
+most are proven instead: [formal/](formal/) holds a SymbiYosys setup that checks
+the state machine, the reset pulse and the `LOCK` invariant under every possible
+input sequence.
+
 ## What is Tiny Tapeout?
 
 Tiny Tapeout is an educational project that makes it easier and cheaper than
