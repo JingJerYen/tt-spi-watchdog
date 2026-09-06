@@ -6,17 +6,26 @@
 
 [tasks]
 bmc
+proof
 cover
 irq_demo
 
 [options]
 # bmc = Bounded Model Check: 從 reset 起，把「所有」可能的輸入序列
-#       展開 depth 拍，看有沒有任何一條會違反 assert。
+#       展開 depth 拍(不寫預設20)，看有沒有任何一條會違反 assert。
 bmc:      mode bmc
 bmc:      depth 100
+
+# prove = K-induction: 證明性質永遠成立，不是單純瓊舉depth拍而已
+#         若前k拍成立，則第k+1也成立。歸納窗口只要超過某個threshold，
+#         以上都會成立。預設也是20。
+proof:    mode prove
+proof:    depth 5
+
 # cover: 找出一條最短的輸入序列讓每個 cover() 成立
 cover:    mode cover
 cover:    depth 80
+
 irq_demo: mode bmc
 irq_demo: depth 60
 
@@ -31,6 +40,7 @@ smtbmc yices
 plugin -i slang
 irq_demo: read_slang -D DEMO_BUG --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
 bmc:      read_slang --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
+proof:    read_slang --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
 cover:    read_slang --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
 prep -top wdt_formal
 

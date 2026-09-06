@@ -33,17 +33,35 @@ cover(cond);   // 請 solver 找一條路讓 cond 成立，並把波形給你
 source ~/oss-cad-suite/environment
 ```
 
-然後在 `formal/` 目錄下：
+然後在 `formal/` 目錄下用 Makefile：
 
 ```bash
-sby -f wdt.sby bmc
+make
 ```
 
-- `bmc` 跑五個 assert，最後一行印 `PASS` 表示 40 拍內沒有任何輸入序列能違反它們。
+`make` 跑 bmc 和 cover，是日常回歸最常用的組合。其他 target：
+
+| 指令 | 做什麼 |
+| --- | --- |
+| `make bmc` | 有界模型檢查，驗 assert |
+| `make cover` | 產生 cover 的示範波形 |
+| `make proof` | k-induction，證明 assert 永遠成立 |
+| `make irq_demo` | 故意失敗的範例，看反例波形 |
+| `make all` | 四個全跑（`irq_demo` 預期 FAIL） |
+| `make wave` | 用 gtkwave 開最近一次產生的波形 |
+| `make clean` | 刪掉所有 sby 輸出目錄 |
+
+- `bmc` 跑所有 assert，最後一行印 `PASS` 表示 `wdt.sby` 設定的深度（目前 100 拍）內，沒有任何輸入序列能違反它們。
 - `cover` 讓 solver 示範「怎麼讓狗開始數」和「怎麼讓狗咬人」，波形在 `wdt_cover/engine_0/trace*.vcd`。
 - `irq_demo` 故意加一條錯的 assert「IRQ 永遠不亮」，solver 會湊出一段 SPI 波形打臉你，波形在 `wdt_irq_demo/engine_0/trace.vcd`。
 
-看波形：
+看波形，`make wave` 會挑最近產生的那個開：
+
+```bash
+make wave
+```
+
+指定某一個就直接給 gtkwave：
 
 ```bash
 gtkwave wdt_irq_demo/engine_0/trace.vcd
@@ -101,9 +119,95 @@ SBY 文件說支援這些，指的是付費的 Verific 前端。
    如果 bmc 深度還是 40，P6 會 PASS，但那是「前提永遠不成立」的空 PASS，什麼都沒證明。
    這就是為什麼 `wdt.sby` 的 bmc 深度改成了 60。
 
+## 守衛怎麼下：assert 要鬆，cover 要緊
+
+formal 沒有 testbench，時間 0 時每個暫存器都是任意值。`project.v` 的 `fsm_state`、`lock`、`en`
+都沒有初值（ASIC 的正反器本來就沒有定義的開機狀態），而 reset 是同步的，要等第一個正緣才生效。
+所以在 `cyc==0` 那拍，DUT 裡全是垃圾。每條性質都必須用守衛把那段擋掉。
+
+`$past(x)` 也只是一個每個正緣抄一份 `x` 的暫存器，同樣有這個問題。它在 `cyc==1` 抄到的是
+`cyc==0` 的垃圾，所以用了 `$past` 的性質還要再多等一拍。
+
+守衛的原則是問「這條性質讀到的東西，最早從哪一拍開始都有意義」：
+
+| 性質讀什麼 | 守衛 |
+| --- | --- |
+| 只讀當拍的訊號 | `rst_n` |
+| 讀一層 `$past` | `cyc == 2'd2` |
+| 專門驗 reset 那一拍 | `cyc == 2'd1`（P1 就是） |
+
+**但 assert 和 cover 的鬆緊方向相反。**
+
+`assert` 的守衛要**盡量鬆**，鬆到不會誤報為止。檢查的拍數越多，solver 能拿來擺垃圾的無人區越小。
+INV1、P2、P3、P4 都不用 `$past`，所以放 `rst_n`；P5、P6 用了 `$past`，只能放 `cyc == 2'd2`。
+
+`cover` 的守衛要**夠緊**，一律放 `cyc == 2'd2`，不管有沒有用 `$past`。cover 問的是「存不存在一條路」，
+守衛越鬆越容易被滿足，而輕易被滿足的 cover 沒有價值。實測把 cover 區塊改成 `rst_n`，
+三條「回到 IDLE」的 transition cover 就從 28 到 44 拍掉到 2 拍：`state` 是剛 reset 的 IDLE，
+`$past(state)` 是 reset 前的垃圾，solver 想填什麼就填什麼，零工作量達成。
+
+## 三種「空 PASS」
+
+工具給綠燈不代表你證明了東西。這三種都會 PASS，而且都什麼都沒證明：
+
+1. **assert 的前提到不了。** 例如 P6 的前提是 `lock=1`，但 cover 顯示它要 44 拍才到。
+   bmc 深度設 40 的話 P6 必然 PASS，因為前提永遠不成立。
+2. **assert 的守衛太窄。** 例如把 `assert (!dut.lock || dut.en)` 放進 `cyc == 2'd1`，
+   那拍 `lock` 和 `en` 剛被清成 0，必然成立。實測顯示它對 induction 門檻毫無貢獻，
+   而且注入 bug 後叫的是 P6 不是它。
+3. **cover 的守衛落在 reset 之前。** 把 cover 區塊改成 `cyc == 2'd0`，16 條 cover 全部在 1 拍達成，
+   因為 solver 直接把暫存器填成要的值。
+
+怎麼分辨：
+
+- **看拍數，不要只看 PASS。** 這個設計光一筆 SPI 寫入就要 22 拍，所以任何個位數拍就達成的
+  cover 幾乎一定有問題。
+- **每加一條 assert 就配一條 cover**，確認它的前提到得了，並把 bmc 深度設在最深的 cover 之上。
+- **mutation testing。** 故意在 RTL 埋一個那條 assert 應該抓到的 bug，看它是不是真的叫，
+  而且叫的是它而不是別人。這比盯著 PASS 有用得多。
+
+## prove 模式與 invariant
+
+`mode prove` 用 k-induction，證的是「永遠」而不是「前 N 拍」。它不從 reset 出發，而是讓 solver
+憑空捏一個狀態，唯一的條件是前 k 拍 assert 都成立。所以它常常從一個 reset 根本到不了的狀態出發，
+然後失敗。
+
+**induction 失敗通常不是 bug，是缺 invariant。** 標準工作循環是：跑，失敗，解碼
+`trace_induct.vcd` 的第 0 拍看 solver 捏了什麼不可能的狀態，補一條 assert 宣告它不合法，再跑。
+這個設計實際遇過兩個：
+
+- solver 捏 `lock=1` 但 `en=0`。RTL 的 `lock <= lock | (wr_data[4] & en)` 保證這不可能，
+  但沒有 assert 說出來。補上 `assert (!dut.lock || dut.en)`。
+- solver 捏「腳位從沒動過（`quiet=1`）但 SPI shift register 裡躺著一個完整封包」。
+  三拍後就假造出一次寫入打破 P4。補上 `if (quiet)` 底下那組同步器閒置的 assert。
+
+`prove` 的 `depth` 是 k，跟 bmc 的 depth 意義完全不同。k 只是 solver 收斂所需的窗口大小，
+**不是品質指標**：depth 3 的 PASS 和 depth 40 的 PASS 是同一個定理。實測這個設計：
+
+| 設定 | 需要的 depth |
+| --- | --- |
+| 沒有 invariant | 5 |
+| 只加 INV1（lock 蘊含 en） | 5（失敗點推到 P4） |
+| INV1 加 INV2（quiet 時同步器閒置） | 3 |
+
+而 depth 3 跑 0.42 秒、depth 40 跑 0.82 秒，所以對這個大小的設計，寫 invariant 來降 k 不划算。
+真正該降 k 的時機是電路大到 solver 跑不動。實務建議：`proof: depth 10`，然後專心寫規格性質。
+
+**invariant 一定要用 `assert`，絕對不要用 `assume`。** 實測同一個注入的 bug：
+
+```
+invariant 寫成 assert  ->  DONE (FAIL)   抓到了
+invariant 寫成 assume  ->  DONE (PASS)   同一個壞設計，過了
+```
+
+`assume` 是在告訴 solver「這種情況不用考慮」，等於把含 bug 的路徑從搜尋空間裡刪掉。
+內部狀態一律用 assert，`assume` 只留給真正的外部輸入約定。
+
 ## 下一步可以玩的
 
-1. 把 `wdt.sby` 的 `depth 40` 改成 `10`，看 cover 是不是就走不到 `RESET` 了。
+1. 把 `wdt.sby` 的 `cover: depth 80` 改成 `30`，看 cover 是不是就走不到 `RESET` 了（它要 49 拍）。
 2. 再加一條你覺得「應該成立」的性質，例如「RESET_WAIT 只有在 rst_en=1 時才會進 RESET」。
-3. 把 `mode bmc` 改成 `mode prove`（k-induction）。它會嘗試證明「永遠」而不是「前 N 拍」，
-   通常第一次會失敗，因為 solver 會從一個「不可能到達的狀態」出發；補 assert 把那些狀態排除就是 formal 的日常。
+3. `make proof` 已經是 k-induction 了。把 `proof: depth 5` 改成 `4`，看它失敗在哪條 assert，
+   再照「prove 模式與 invariant」那節解碼 `wdt_proof/engine_0/trace_induct.vcd` 的第 0 拍。
+4. 做一次 mutation testing：把 `project.v` 的 `lock <= lock | (wr_data[4] & en)` 改成
+   `lock <= lock | wr_data[4]`，跑 `make bmc`，確認 INV1 真的會叫。記得改回來。

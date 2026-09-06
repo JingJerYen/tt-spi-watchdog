@@ -61,11 +61,11 @@ module wdt_formal (
   // 2. 性質 (properties)
   // -------------------------------------------------------------------------
   always @(posedge clk) begin
-    // P1: reset 完的第一拍一定在 IDLE
-    if (cyc == 2'd1)
-      assert (state == IDLE);
 
-    if (cyc == 2'd2) begin
+    if (rst_n) begin
+      // invariant: lock 只能在 EN=1 時被設，i.e. (lock,en) can only be (0,0), (0,1), (1,1)
+      assert (!dut.lock || dut.en);
+
       // P2: 狀態編碼永遠合法 (3 bit 有 8 種，只用了 5 種)
       assert (state <= RESET);
 
@@ -75,7 +75,13 @@ module wdt_formal (
       // P4: 沒人餵狗、沒 SPI 動作，狗就不會自己醒來
       if (quiet)
         assert (state == IDLE);
+    end
 
+    // P1: reset 完的第一拍一定在 IDLE
+    if (cyc == 2'd1)
+      assert (state == IDLE);
+
+    if (cyc == 2'd2) begin
       // P5: FSM 只能走圖上畫的邊 ($past = 上一拍的值)
       case ($past(state))
         IDLE:       assert (state == IDLE || state == EARLY || state == NORMAL);
@@ -85,7 +91,6 @@ module wdt_formal (
         RESET:      assert (state == IDLE || state == RESET);
         default:    assert (0);
       endcase
-
 
       // P6: LOCK 設了以後，EN 就不能被關掉，LOCK 也不能被清掉
       // (dut.lock 是階層參照，只有 slang 前端吃得下)
@@ -106,9 +111,28 @@ module wdt_formal (
     // 3. cover: 請 solver 示範「怎麼走到這裡」
     // -------------------------------------------------------------------------
     if (cyc == 2'd2) begin
-      cover (state == NORMAL);   // 狗被啟動、正在數
+       // ---- state coverage: 每個狀態都到得了 ----
+      cover (state == EARLY);
+      cover (state == RESET_WAIT);
+      cover (state == RESET);
+
+      // ---- transition coverage: P5 列的每條邊都真的會走 ----
+      cover ($past(state) == IDLE       && state == EARLY);       // kick, 有 window
+      cover ($past(state) == IDLE       && state == NORMAL);      // kick, 無 window
+      cover ($past(state) == EARLY      && state == NORMAL);      // early 視窗過了
+      cover ($past(state) == EARLY      && state == RESET_WAIT);  // 太早餵
+      cover ($past(state) == EARLY      && state == IDLE);        // EN 清掉
+      cover ($past(state) == NORMAL     && state == EARLY);       // 正常餵, 回到 early 視窗
+      cover ($past(state) == NORMAL     && state == RESET_WAIT);  // timeout
+      cover ($past(state) == NORMAL     && state == IDLE);        // EN 清掉
+      cover ($past(state) == RESET_WAIT && state == RESET);       // 寬限期過, 咬
+      cover ($past(state) == RESET_WAIT && state == IDLE);        // W1C 或 rst_en=0 逃出
+      // cover ($past(state) == RESET      && state == IDLE);     // pulse 結束要 2^19 拍，太久無法formal
+
       cover (!wdt_rst_n);        // 一路走到咬人 (reset pulse)
+      cover (irq);               // 可以發出irq
       cover (dut.lock);          // LOCK 到得了嗎 (P6 的前提)
+      cover (irq && (state == IDLE));  // 即使回到IDLE，仍可能還沒清irq
     end
   end
 
