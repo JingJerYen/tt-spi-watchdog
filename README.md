@@ -18,6 +18,16 @@ A windowed watchdog timer for an external MCU, configured over SPI, built for
 📖 **[Full documentation (datasheet source)](docs/info.md)** — interface,
 SPI register map, state machine, and timing.
 
+## PPA
+
+Numbers from the sky130A OpenLane 2 signoff run.
+
+| | |
+| --- | --- |
+| **Power** | ~0.44 mW at the 50 MHz clock, 0.38 mW typical; 44% clock tree, 54% flops, leakage 7.6 nW. A coin cell would keep the dog awake for ~2 months. |
+| **Performance** | Ships at 50 MHz, clean at every corner down to 100 C at 1.60 V; ~105 MHz worst case, ~180 MHz typical. Timeouts from 5.24 ms to 5.37 s, or 687 s with the prescaler, with a formally proven 1.31 ms grace period and 10.49 ms reset pulse. |
+| **Area** | One tile, 161 x 111.52 um = 0.018 mm^2; 817 standard cells, 102 flops, 36.2% utilization, 9.5 mm of routing. |
+
 ## GDS
 
 [View in 3D](https://gds-viewer.tinytapeout.com/?pdk=sky130A&model=https%3A%2F%2Fjingjeryen.github.io%2Ftt-spi-watchdog%2Ftinytapeout.oas)
