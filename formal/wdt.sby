@@ -1,8 +1,9 @@
-# SymbiYosys 設定檔。執行方式 (在 formal/ 目錄下):
-#   sby -f wdt.sby bmc        # 檢查 assert (有界模型檢查)
-#   sby -f wdt.sby cover      # 產生 cover 的示範波形
-#   sby -f wdt.sby irq_demo   # 故意失敗，看反例波形
-#   sby -f wdt.sby            # 三個 task 全跑
+# SymbiYosys configuration. Run from formal/ with the Makefile:
+#   make bmc        bounded model check, checks the asserts
+#   make cover      produce a waveform for each cover
+#   make proof      k-induction, proves the asserts hold forever
+#   make irq_demo   deliberately failing example, shows a counterexample
+#   make all        all four (irq_demo is expected to FAIL)
 
 [tasks]
 bmc
@@ -11,18 +12,22 @@ cover
 irq_demo
 
 [options]
-# bmc = Bounded Model Check: 從 reset 起，把「所有」可能的輸入序列
-#       展開 depth 拍(不寫預設20)，看有沒有任何一條會違反 assert。
+# bmc = bounded model check: unroll every possible input sequence from reset
+#       for `depth` cycles and look for one that violates an assert.
+#       Defaults to 20 if omitted, which is not enough here: a single SPI
+#       frame already takes 22 cycles.
 bmc:      mode bmc
 bmc:      depth 100
 
-# prove = K-induction: 證明性質永遠成立，不是單純瓊舉depth拍而已
-#         若前k拍成立，則第k+1也成立。歸納窗口只要超過某個threshold，
-#         以上都會成立。預設也是20。
+# prove = k-induction: proves a property holds forever rather than just for
+#         `depth` cycles. Here `depth` is the induction window k, not a trace
+#         length, and it does not change the strength of the result: a pass at
+#         depth 3 and a pass at depth 40 are the same theorem. 5 is the
+#         measured minimum for this design; leave headroom.
 proof:    mode prove
 proof:    depth 5
 
-# cover: 找出一條最短的輸入序列讓每個 cover() 成立
+# cover: find the shortest input sequence that satisfies each cover()
 cover:    mode cover
 cover:    depth 80
 
@@ -30,13 +35,17 @@ irq_demo: mode bmc
 irq_demo: depth 60
 
 [engines]
-# smtbmc = 把電路翻成 SMT 公式，丟給 solver。yices 是這裡最快的通用選擇。
+# smtbmc translates the circuit into SMT formulas for a solver.
+# yices is the fastest general-purpose choice here.
 smtbmc yices
 
 [script]
-# 用 slang 前端讀 SystemVerilog，而不是 yosys 內建的 read -formal。
-# 原因：內建前端不支援 dut.lock 這種階層參照 (bind 也只會 parse 不會生效)，
-# 有了 slang，wrapper 才能直接 assert DUT 內部的 reg，RTL 一行不用改。
+# Read with the slang frontend rather than the built-in `read -formal`.
+# The built-in frontend cannot resolve hierarchical references such as
+# dut.lock, and silently drops SystemVerilog `bind` instead of applying it,
+# which would give a green light on properties that never entered the design.
+# With slang the wrapper can assert on the DUT's internal registers and
+# src/ stays untouched.
 plugin -i slang
 irq_demo: read_slang -D DEMO_BUG --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
 bmc:      read_slang --top wdt_formal clk_div_pow2.v spi_regs.v project.v wdt_formal.sv
