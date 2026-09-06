@@ -278,6 +278,7 @@ module tt_um_jjy_spi_watchdog #(
       if (wr_ctrl2 && !lock && fsm_state == IDLE) begin
         prescaler <= wr_data[2:0];
         rst_en <= wr_data[3];
+        // lock can only be set when en=1, and is sticky until rst_n=0
         lock <= lock | (wr_data[4] & en);
       end
 

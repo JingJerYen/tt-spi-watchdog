@@ -238,6 +238,18 @@ impossible until `rst_n`. The intended arming sequence for a locked
 watchdog is: write `CTRL` with the final settings and `EN` = 1, write
 `CTRL2` with the final settings and `LOCK` = 1, then `KICK`.
 
+The order matters because `LOCK` is granted only if `EN` is already 1 when
+the `CTRL2` frame commits, and `EN` lives in `CTRL`, a different address.
+A single frame can therefore never both arm and lock the watchdog. The same
+window opens again after a fault, which returns to `IDLE` with `EN` still 1,
+so a watchdog can also be locked at that point.
+
+A refused `LOCK` is silent: no flag is raised, and the rest of the frame is
+not discarded with it. In `IDLE` with `EN` = 0 the new `PRESCALER` and
+`RST_EN` still take effect while `LOCK` stays 0, leaving the watchdog
+configured but unlocked. Outside `IDLE` the whole `CTRL2` write is dropped
+instead. Read `CTRL2` back and check bit 4 to confirm the lock took.
+
 #### `PAUSE`
 
 `PAUSE` (`ui_in[3]`) high freezes the window: the counter and the prescaler
